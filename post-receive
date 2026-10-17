@@ -1,0 +1,239 @@
+#!/bin/sh
+#
+# post-receive - one-file push-to-deploy for the ~/deploy layout.
+#
+# Install (per host, from the desktop):
+#   ssh HOST 'cat > ~/deploy/post-receive &&
+#             chmod 755 ~/deploy/post-receive' < post-receive
+# then per app, symlink the repo's hook at that one file:
+#   ssh HOST 'ln -sfn ../../../post-receive ~/deploy/repos/APP/hooks/post-receive'
+# init-app.sh does both. Every repo shares the file, so shipping a hook update
+# is overwriting ~/deploy/post-receive once.
+#
+# Layout it owns:
+#   ~/deploy/post-receive         this hook; repos symlink their hook to it
+#   ~/deploy/repos/<app>          bare repo (the push target)
+#   ~/deploy/live/<app>!<hash>    one release dir per commit
+#   ~/deploy/live/<app>!CURRENT   symlink -> the deployed release
+#   ~/deploy/shared/<app>/env     environment file, read by the unit
+#   ~/deploy/shared/<app>/deploy.conf   optional command overrides (see below)
+#
+# Commands are detected from the tree: pnpm-lock.yaml -> pnpm install/build/start;
+# uv.lock -> uv sync + .venv/bin/python main.py. Anything else goes in deploy.conf:
+#   SYNC="..."  AFTER_SYNC="..."  BUILD="..."  EXEC="..."  UNIT_ENV="A=1 B=2"
+#
+# The unit is regenerated whenever its content changes, so editing deploy.conf
+# and re-pushing is enough - never hand-edit the unit.
+set -eu
+
+# post-receive cannot fail a push (only pre-receive/update can), so a failure
+# has to shout in the push output - and must never leave a half-made release.
+die() {
+    echo "post-receive: DEPLOY FAILED: $1" >&2
+    exit 1
+}
+
+# --- where -------------------------------------------------------------------
+REPO_DIR=$(git rev-parse --absolute-git-dir)
+REPO_NAME=$(basename "$REPO_DIR")
+SERVICE_NAME=${REPO_NAME%.git}
+# Only pushes to this branch deploy; DEPLOY_REF overrides it server-side.
+DEPLOY_REF=${DEPLOY_REF:-refs/heads/master}
+
+DEPLOY_ROOT=$(cd "$REPO_DIR/../.." && pwd)
+LIVE_ROOT="${DEPLOY_ROOT}/live"
+SHARED_DIR="${DEPLOY_ROOT}/shared/${REPO_NAME}"
+SHARED_ENV="${SHARED_DIR}/env"
+SHARED_CONF="${SHARED_DIR}/deploy.conf"
+UNIT_FILE="${HOME}/.config/systemd/user/${SERVICE_NAME}.service"
+
+# --- which commit (stdin carries "<old> <new> <ref>" per updated ref) --------
+DEPLOY_REV=""
+while read -r _old new ref; do
+    [ "$ref" = "$DEPLOY_REF" ] || continue
+    # All-zero new rev means the branch was deleted: nothing to deploy.
+    case "$new" in 0000000000000000000000000000000000000000) continue ;; esac
+    DEPLOY_REV=$new
+done
+
+if [ -z "$DEPLOY_REV" ]; then
+    echo "post-receive: no update to ${DEPLOY_REF}, nothing to deploy."
+    exit 0
+fi
+
+HASH=$(git rev-parse --short "$DEPLOY_REV")
+LIVE_DIR="${LIVE_ROOT}/${REPO_NAME}!${HASH}"
+LIVE_DIR_CURR="${LIVE_ROOT}/${REPO_NAME}!CURRENT"
+
+# --- tools (push shells are non-interactive, so resolve absolutely) ----------
+if ! UV=$(command -v uv 2>/dev/null); then UV="${HOME}/.local/bin/uv"; fi
+if ! NODE=$(command -v node 2>/dev/null); then NODE=/usr/bin/node; fi
+if ! PNPM=$(command -v pnpm 2>/dev/null); then PNPM=/usr/local/bin/pnpm; fi
+if ! command -v systemctl >/dev/null 2>&1; then
+    die "systemctl not found; this hook assumes a systemd user session."
+fi
+
+if [ ! -f "$SHARED_ENV" ]; then
+    die "${SHARED_ENV} is missing - create it with the app's environment
+              (e.g. DATABASE_URL=...), then push again."
+fi
+
+mkdir -p "$LIVE_ROOT"
+
+CURRENT_TARGET=""
+if [ -L "$LIVE_DIR_CURR" ]; then
+    CURRENT_TARGET=$(readlink -f "$LIVE_DIR_CURR")
+fi
+
+# Re-pushing the deployed commit reuses its release dir, and checkout -f leaves
+# files that commit deleted. Clear it first - never while it is CURRENT.
+if [ "$LIVE_DIR" != "$CURRENT_TARGET" ]; then
+    rm -rf "$LIVE_DIR"
+fi
+mkdir -p "$LIVE_DIR"
+
+echo "Checking out ${HASH}..."
+git --work-tree="$LIVE_DIR" checkout -f "$DEPLOY_REV" -- .
+
+# --- detect the app ----------------------------------------------------------
+RUNTIME=""
+SYNC=""
+BUILD=""
+EXEC=""
+UNIT_ENV=""
+AFTER_SYNC=""
+
+if [ -f "$LIVE_DIR/pnpm-lock.yaml" ]; then
+    RUNTIME=node
+    if [ ! -x "$NODE" ]; then
+        die "node not found on PATH or at /usr/bin (the app runs via pnpm start)."
+    fi
+    SYNC="${PNPM} install --frozen-lockfile"
+    if grep -q '"build"[[:space:]]*:' "$LIVE_DIR/package.json" 2>/dev/null; then
+        BUILD="${PNPM} build"
+    fi
+    EXEC="${PNPM} start"
+    UNIT_ENV="NODE_ENV=production"
+elif [ -f "$LIVE_DIR/uv.lock" ]; then
+    RUNTIME=python
+    SYNC="${UV} sync --locked --no-dev"
+    if [ -f "$LIVE_DIR/main.py" ]; then
+        EXEC="${LIVE_DIR_CURR}/.venv/bin/python main.py"
+    fi
+    UNIT_ENV="PYTHONUNBUFFERED=1"
+else
+    die "no uv.lock or pnpm-lock.yaml at ${HASH} - set SYNC and EXEC in
+              ${SHARED_CONF} if this is intentional."
+fi
+
+# Optional per-repo overrides win over detection.
+if [ -f "$SHARED_CONF" ]; then
+    # shellcheck disable=SC1090
+    . "$SHARED_CONF"
+fi
+
+# {repo} {hash} {root} {live} {live_curr} {shared} expand in commands and env,
+# so a deploy.conf can name paths without hardcoding this server's layout.
+expand() {
+    sed -e "s|{repo}|${REPO_NAME}|g" \
+        -e "s|{hash}|${HASH}|g" \
+        -e "s|{root}|${DEPLOY_ROOT}|g" \
+        -e "s|{live}|${LIVE_DIR}|g" \
+        -e "s|{live_curr}|${LIVE_DIR_CURR}|g" \
+        -e "s|{shared}|${SHARED_DIR}|g"
+}
+
+SYNC=$(printf '%s' "$SYNC" | expand)
+EXEC=$(printf '%s' "$EXEC" | expand)
+if [ -n "${BUILD:-}" ]; then BUILD=$(printf '%s' "$BUILD" | expand); fi
+if [ -n "${AFTER_SYNC:-}" ]; then AFTER_SYNC=$(printf '%s' "$AFTER_SYNC" | expand); fi
+if [ -n "${UNIT_ENV:-}" ]; then UNIT_ENV=$(printf '%s' "$UNIT_ENV" | expand); fi
+
+for var in SYNC EXEC; do
+    eval "value=\${$var:-}"
+    if [ -z "$value" ]; then
+        die "${var} is empty for this app - set it in ${SHARED_CONF}."
+    fi
+done
+
+cd "$LIVE_DIR"
+echo "Syncing deps (${RUNTIME})..."
+# Command strings are intentionally unquoted: they carry their own arguments.
+# shellcheck disable=SC2086
+if ! $SYNC; then
+    die "sync failed: ${SYNC}"
+fi
+if [ -n "${AFTER_SYNC:-}" ]; then
+    # shellcheck disable=SC2086
+    if ! $AFTER_SYNC; then
+        die "AFTER_SYNC failed: ${AFTER_SYNC}"
+    fi
+fi
+if [ -n "${BUILD:-}" ]; then
+    echo "Building..."
+    # shellcheck disable=SC2086
+    if ! $BUILD; then
+        die "build failed: ${BUILD}"
+    fi
+fi
+
+# --- systemd user unit (regenerated when it differs) -------------------------
+UNIT_EXTRA=""
+for line in ${UNIT_ENV:-}; do
+    UNIT_EXTRA="${UNIT_EXTRA}Environment=${line}
+"
+done
+
+UNIT_BODY="# Generated by post-receive - edit ${SHARED_CONF}, not this file.
+[Unit]
+Description=${SERVICE_NAME}
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=${LIVE_DIR_CURR}
+ExecStart=${EXEC}
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=${SHARED_ENV}
+${UNIT_EXTRA}[Install]
+WantedBy=default.target
+"
+
+NEW_UNIT=0
+if [ ! -f "$UNIT_FILE" ]; then
+    NEW_UNIT=1
+fi
+
+# Both sides go through command substitution so the comparison ignores a
+# trailing newline; otherwise every deploy would look like a change.
+if [ "$NEW_UNIT" = 1 ] || [ "$(cat "$UNIT_FILE" 2>/dev/null)" != "$(printf '%s' "$UNIT_BODY")" ]; then
+    echo "Installing ${SERVICE_NAME}.service..."
+    mkdir -p "$(dirname "$UNIT_FILE")"
+    printf '%s' "$UNIT_BODY" > "$UNIT_FILE"
+    systemctl --user daemon-reload
+    if [ "$NEW_UNIT" = 1 ]; then
+        systemctl --user enable "${SERVICE_NAME}.service"
+    fi
+fi
+
+# --- activate -----------------------------------------------------------------
+echo "Linking CURRENT -> ${HASH}..."
+cd "$LIVE_ROOT"
+ln -sfn "$(basename "$LIVE_DIR")" "$(basename "$LIVE_DIR_CURR")"
+
+echo "Restarting ${SERVICE_NAME}..."
+systemctl --user restart "${SERVICE_NAME}.service"
+
+# Every other release dir for this repo is either the one just replaced or the
+# wreckage of a deploy that died before it was activated - neither is reachable
+# through CURRENT, so both go now that the new release is serving.
+for dir in "$LIVE_ROOT/${REPO_NAME}"!*; do
+    case "$dir" in *"!CURRENT") continue ;; esac
+    if [ ! -d "$dir" ]; then continue; fi
+    if [ "$dir" = "$LIVE_DIR" ]; then continue; fi
+    echo "Removing stale release $(basename "$dir")..."
+    rm -rf "$dir"
+done
+
+echo "Deployed ${REPO_NAME} ${HASH}."
