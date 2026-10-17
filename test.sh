@@ -1,9 +1,9 @@
 #!/bin/sh
-# Sandbox test for the post-receive hook and init-app.sh next to this script.
+# Sandbox test for the post-receive hook and deploy.sh next to this script.
 #
 # DEPLOY_ROOT is faked by putting the bare repos two levels below $SB, and HOME
 # is faked so the generated unit lands in the sandbox - the real systemd session
-# is never touched (systemctl is a stub early on PATH). init-app.sh is driven
+# is never touched (systemctl is a stub early on PATH). deploy.sh is driven
 # through a stub ssh that runs its remote half locally against the same sandbox.
 #
 #   sh test.sh                 # uses $FRAMER (default ~/projects/framer) as the real-tree case
@@ -12,7 +12,7 @@ set -u
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 HOOK="$DIR/post-receive"
-INITAPP="$DIR/init-app.sh"
+DEPLOY="$DIR/deploy.sh"
 FRAMER=${FRAMER:-$HOME/projects/framer}
 SB=${SB:-${TMPDIR:-/tmp}/deploy-hook-test}
 
@@ -75,6 +75,15 @@ cat > "$SB/bin/ssh" <<'FAKE'
 echo "ssh $1" >> "$CALLS"
 shift
 exec sh -c "$*"
+FAKE
+cat > "$SB/bin/editenv" <<'FAKE'
+#!/bin/sh
+# fake $EDITOR for env edit: append one valid line to the file given in $1
+echo "EDITED=yes" >> "$1"
+FAKE
+cat > "$SB/bin/noedit" <<'FAKE'
+#!/bin/sh
+# fake $EDITOR that changes nothing
 FAKE
 chmod +x "$SB"/bin/*
 
@@ -242,10 +251,10 @@ eq "retry deploys cleanly" "$(readlink -f "$SB/live/failapp!CURRENT")" "$SB/live
 is_absent "failed deploy's orphan release pruned" "$SB/live/failapp!$HF"
 
 echo
-echo "=== 6. init-app.sh: fresh target, then a real push through it ==="
-out=$("$INITAPP" eli@sg1 newapp 2>&1); rc=$?
-eq "init-app exits 0" "$rc" 0
-has "init-app ssh'd to the given host" "ssh eli@sg1" "$CALLS"
+echo "=== 6. deploy.sh init: fresh target, then a real push through it ==="
+out=$("$DEPLOY" init eli@sg1 newapp 2>&1); rc=$?
+eq "init exits 0" "$rc" 0
+has "init ssh'd to the given host" "ssh eli@sg1" "$CALLS"
 ISB="$SB/home/deploy"
 IREPO="$ISB/repos/newapp"
 eq "its repo is bare" "$(git -C "$IREPO" rev-parse --is-bare-repository 2>/dev/null)" true
@@ -258,8 +267,14 @@ is_dir "shared dir created" "$ISB/shared/newapp"
 is_absent "no env file fabricated" "$ISB/shared/newapp/env"
 case "$out" in *"Initialized newapp on eli@sg1."*) ok "next steps printed" ;; *) bad "next steps printed"; echo "$out" | sed 's/^/    | /' ;; esac
 
-# README step 2: the secrets file, then a push through the fresh repo
-printf 'DATABASE_URL=postgresql://sandbox/db\n' > "$ISB/shared/newapp/env"
+# README step 2: set the secrets, then push through the fresh repo. env set
+# creates the file (600); with no unit deployed yet it just prints a hint.
+out=$("$DEPLOY" env set eli@sg1 newapp DATABASE_URL=postgresql://sandbox/db 2>&1); rc=$?
+eq "env set exits 0" "$rc" 0
+is_file "env file created by env set" "$ISB/shared/newapp/env"
+eq "env file is 600" "$(stat -c %a "$ISB/shared/newapp/env")" 600
+case "$out" in *"No unit for newapp yet"*) ok "no unit yet: env set prints a hint" ;; *) bad "no unit yet: env set prints a hint"; echo "$out" | sed 's/^/    | /' ;; esac
+eq "env content written" "$(cat "$ISB/shared/newapp/env")" "DATABASE_URL=postgresql://sandbox/db"
 app_repo newapp
 push_out=$(git -C "$SB/src/newapp" push "$IREPO" master 2>&1)
 HN=$(git -C "$IREPO" rev-parse --short master)
@@ -277,12 +292,12 @@ git -C "$SB/src/newapp" commit -q --allow-empty -m two
 push_out=$(git -C "$SB/src/newapp" push "$IREPO" master 2>&1)
 case "$push_out" in *"shared hook v2"*) ok "one shared file updates the hook" ;; *) bad "one shared file updates the hook"; echo "$push_out" | sed 's/^/    | /' ;; esac
 
-# re-running init-app refreshes the shared hook, restores the symlink, and
+# re-running init refreshes the shared hook, restores the symlink, and
 # touches nothing else - a regular file from an old install is replaced
 rm -f "$IREPO/hooks/post-receive"
 printf '#!/bin/sh\necho tampered\n' > "$IREPO/hooks/post-receive"
 refs_before=$(git -C "$IREPO" show-ref)
-"$INITAPP" eli@sg1 newapp >/dev/null 2>&1
+"$DEPLOY" init eli@sg1 newapp >/dev/null 2>&1
 same "re-run refreshes the shared hook" "$HOOK" "$ISB/post-receive"
 is_link "re-run restores the symlink" "$IREPO/hooks/post-receive"
 links_to "re-run points the repo at the shared hook" "$IREPO/hooks/post-receive" "$ISB/post-receive"
@@ -290,15 +305,104 @@ eq "re-run leaves refs alone" "$(git -C "$IREPO" show-ref)" "$refs_before"
 is_file "env survives re-init" "$ISB/shared/newapp/env"
 
 # argument validation
-"$INITAPP" eli@sg1 'bad name' >/dev/null 2>&1; rc=$?
+"$DEPLOY" init eli@sg1 'bad name' >/dev/null 2>&1; rc=$?
 eq "odd app name rejected" "$rc" 2
-"$INITAPP" eli@sg1 >/dev/null 2>&1; rc=$?
+"$DEPLOY" init eli@sg1 >/dev/null 2>&1; rc=$?
 eq "HOST and APP are both required" "$rc" 2
+"$DEPLOY" init eli@sg1 newapp extra >/dev/null 2>&1; rc=$?
+eq "extra init arguments rejected" "$rc" 2
 mkdir -p "$SB/lonely"
-cp "$INITAPP" "$SB/lonely/"
-out=$("$SB/lonely/init-app.sh" eli@sg1 newapp 2>&1); rc=$?
+cp "$DEPLOY" "$SB/lonely/"
+out=$("$SB/lonely/deploy.sh" init eli@sg1 newapp 2>&1); rc=$?
 eq "no hook next to the script fails" "$rc" 1
 case "$out" in *"no post-receive next to this script"*) ok "missing hook named in error" ;; *) bad "missing hook named in error" ;; esac
+
+echo
+echo "=== 7. deploy.sh env: set/get/ls/rm/import/edit ==="
+ENVFILE="$ISB/shared/newapp/env"
+WEIRD="a b \"c\" #d \$e 'f'"
+
+# multi set: an ordinary key and one that needs quoting; the unit now exists,
+# so the change must restart the service
+restarts_before=$(grep -c "restart newapp.service" "$CALLS" || true)
+out=$("$DEPLOY" env set eli@sg1 newapp API_KEY=sk-123 "WEIRD=$WEIRD" 2>&1); rc=$?
+eq "env set exits 0" "$rc" 0
+case "$out" in *"Set API_KEY."*"Set WEIRD."*) ok "set names the keys" ;; *) bad "set names the keys"; echo "$out" | sed 's/^/    | /' ;; esac
+eq "get returns the plain value" "$("$DEPLOY" env get eli@sg1 newapp API_KEY)" "sk-123"
+eq "weird value round-trips" "$("$DEPLOY" env get eli@sg1 newapp WEIRD)" "$WEIRD"
+if grep -q '^WEIRD="' "$ENVFILE"; then ok "weird value quoted in the file"; else bad "weird value quoted in the file"; fi
+eq "changed env restarted the service" "$(grep -c 'restart newapp.service' "$CALLS")" "$((restarts_before + 1))"
+case "$("$DEPLOY" env ls eli@sg1 newapp)" in
+    *DATABASE_URL*API_KEY*WEIRD*) ok "ls lists keys" ;;
+    *) bad "ls lists keys" ;;
+esac
+
+# set again: the key's line is replaced, not duplicated; no-op skips restarts
+"$DEPLOY" env set eli@sg1 newapp API_KEY=sk-456 >/dev/null 2>&1
+eq "re-set replaces the value" "$("$DEPLOY" env get eli@sg1 newapp API_KEY)" "sk-456"
+eq "re-set does not duplicate the key" "$(grep -c '^API_KEY=' "$ENVFILE")" 1
+restarts_before=$(grep -c "restart newapp.service" "$CALLS" || true)
+out=$("$DEPLOY" env set eli@sg1 newapp API_KEY=sk-456 2>&1)
+case "$out" in *"No changes."*) ok "no-op set prints No changes." ;; *) bad "no-op set prints No changes." ;; esac
+eq "no-op set restarts nothing" "$(grep -c 'restart newapp.service' "$CALLS")" "$restarts_before"
+out=$("$DEPLOY" env set --no-restart eli@sg1 newapp API_KEY=sk-789 2>&1)
+case "$out" in *"Set API_KEY."*) ok "set --no-restart still writes" ;; *) bad "set --no-restart still writes" ;; esac
+eq "set --no-restart restarts nothing" "$(grep -c 'restart newapp.service' "$CALLS")" "$restarts_before"
+
+# hidden prompt (stdin is a pipe, so it reads without a tty)
+printf 'prompted-secret\n' | "$DEPLOY" env set eli@sg1 newapp PROMPTED >/dev/null 2>&1; rc=$?
+eq "prompted set exits 0" "$rc" 0
+eq "prompted value stored" "$("$DEPLOY" env get eli@sg1 newapp PROMPTED)" "prompted-secret"
+
+# rm: removes a key, then refuses a missing one without writing
+"$DEPLOY" env rm eli@sg1 newapp PROMPTED >/dev/null 2>&1; rc=$?
+eq "rm exits 0" "$rc" 0
+"$DEPLOY" env get eli@sg1 newapp PROMPTED >/dev/null 2>&1; rc=$?
+eq "removed key is gone" "$rc" 1
+cp "$ENVFILE" "$SB/env.before"
+"$DEPLOY" env rm eli@sg1 newapp NOPE >/dev/null 2>&1; rc=$?
+eq "rm of missing key exits 1" "$rc" 1
+same "rm of missing key wrote nothing" "$SB/env.before" "$ENVFILE"
+
+# validation: bad key, and an app that was never initialized
+cp "$ENVFILE" "$SB/env.before"
+"$DEPLOY" env set eli@sg1 newapp '1BAD=x' >/dev/null 2>&1; rc=$?
+eq "bad key exits 2" "$rc" 2
+same "bad key wrote nothing" "$SB/env.before" "$ENVFILE"
+out=$("$DEPLOY" env set eli@sg1 ghost KEY=1 2>&1); rc=$?
+eq "uninitialized app exits 1" "$rc" 1
+case "$out" in *"not initialized"*) ok "uninitialized app named in error" ;; *) bad "uninitialized app named in error" ;; esac
+
+# import: comments and blanks are skipped, values are merged; bad input aborts
+cat > "$SB/import.env" <<'EOF'
+# secrets for newapp
+FROMFILE=two words
+
+EMPTY=
+EOF
+out=$("$DEPLOY" env import eli@sg1 newapp "$SB/import.env" 2>&1); rc=$?
+eq "import exits 0" "$rc" 0
+eq "import applied a quoted value" "$("$DEPLOY" env get eli@sg1 newapp FROMFILE)" "two words"
+eq "import applied an empty value" "$("$DEPLOY" env get eli@sg1 newapp EMPTY)" ""
+if grep -q 'secrets for newapp' "$ENVFILE"; then bad "import does not copy comments"; else ok "import does not copy comments"; fi
+printf 'FROMSTDIN=1\n' | "$DEPLOY" env import eli@sg1 newapp - >/dev/null 2>&1; rc=$?
+eq "import from stdin exits 0" "$rc" 0
+eq "import from stdin applied" "$("$DEPLOY" env get eli@sg1 newapp FROMSTDIN)" 1
+printf 'not a pair\n' > "$SB/bad.env"
+cp "$ENVFILE" "$SB/env.before"
+"$DEPLOY" env import eli@sg1 newapp "$SB/bad.env" >/dev/null 2>&1; rc=$?
+eq "bad import exits 2" "$rc" 2
+same "bad import wrote nothing" "$SB/env.before" "$ENVFILE"
+
+# edit: the fake editor appends a line; a no-change editor uploads nothing
+EDITOR="$SB/bin/editenv" "$DEPLOY" env edit eli@sg1 newapp >/dev/null 2>&1; rc=$?
+eq "edit exits 0" "$rc" 0
+eq "edit applied" "$("$DEPLOY" env get eli@sg1 newapp EDITED)" "yes"
+restarts_before=$(grep -c "restart newapp.service" "$CALLS" || true)
+out=$(EDITOR="$SB/bin/noedit" "$DEPLOY" env edit eli@sg1 newapp 2>&1); rc=$?
+eq "no-op edit exits 0" "$rc" 0
+case "$out" in *"No changes."*) ok "no-op edit prints No changes." ;; *) bad "no-op edit prints No changes." ;; esac
+eq "no-op edit restarts nothing" "$(grep -c 'restart newapp.service' "$CALLS")" "$restarts_before"
 
 echo
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "FAILURES PRESENT"; fi

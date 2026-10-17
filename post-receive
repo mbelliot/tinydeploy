@@ -7,8 +7,8 @@
 #             chmod 755 ~/deploy/post-receive' < post-receive
 # then per app, symlink the repo's hook at that one file:
 #   ssh HOST 'ln -sfn ../../../post-receive ~/deploy/repos/APP/hooks/post-receive'
-# init-app.sh does both. Every repo shares the file, so shipping a hook update
-# is overwriting ~/deploy/post-receive once.
+# deploy.sh init does both. Every repo shares the file, so shipping a hook
+# update is overwriting ~/deploy/post-receive once.
 #
 # Layout it owns:
 #   ~/deploy/post-receive         this hook; repos symlink their hook to it
