@@ -126,7 +126,7 @@ if [ -d "$FRAMER/.git" ]; then
     is_file "unit installed" "$UNIT"
     has "unit exec" "ExecStart=$SB/bin/pnpm start" "$UNIT"
     has "unit working dir" "WorkingDirectory=$SB/live/framer!CURRENT" "$UNIT"
-    has "unit env file" "EnvironmentFile=$SB/shared/framer/env" "$UNIT"
+    has "unit env file" "EnvironmentFile=-$SB/shared/framer/env" "$UNIT"
     has "unit runtime env" "Environment=NODE_ENV=production" "$UNIT"
     has "unit restart policy" "Restart=on-failure" "$UNIT"
     eq "CURRENT symlink" "$(readlink -f "$SB/live/framer!CURRENT")" "$REL"
@@ -202,14 +202,19 @@ is_file "app tree in release" "$REL_P/main.py"
 
 echo
 echo "=== 4. failure paths ==="
+# env is optional: no env file still deploys, and the unit's EnvironmentFile=
+# carries the '-' prefix so systemd starts the app with the file absent.
 restarts_before=$(grep -c "restart framer.service" "$CALLS" || true)
 rm -f "$SB/shared/framer/env"
 # a no-op push wouldn't run the hook at all, so re-create the ref first
 git -C "$SB/repos/framer" update-ref -d refs/heads/master
 out=$(git -C "$FRAMER" push "$SB/repos/framer" master 2>&1); rc=$?
-case "$out" in *"DEPLOY FAILED"*) ok "missing shared env fails loudly" ;; *) bad "missing shared env fails loudly"; echo "$out" ;; esac
-eq "no restart after failed deploy" "$(grep -c 'restart framer.service' "$CALLS")" "$restarts_before"
-eq "CURRENT untouched by failed deploy" "$(readlink -f "$SB/live/framer!CURRENT")" "$REL"
+eq "push without env succeeds" "$rc" 0
+case "$out" in *"DEPLOY FAILED"*) bad "missing env does not fail the deploy"; echo "$out" ;; *) ok "missing env does not fail the deploy" ;; esac
+case "$out" in *"$SB/shared/framer/env is missing - deploying without it"*) ok "missing env noted in push output" ;; *) bad "missing env noted in push output"; echo "$out" ;; esac
+has "unit tolerates a missing env file" "EnvironmentFile=-$SB/shared/framer/env" "$UNIT"
+eq "app restarted without env" "$(grep -c 'restart framer.service' "$CALLS")" "$((restarts_before + 1))"
+eq "CURRENT holds the env-less deploy" "$(readlink -f "$SB/live/framer!CURRENT")" "$REL"
 printf 'DATABASE_URL=x\n' > "$SB/shared/framer/env"
 
 git init -q -b master "$SB/src/weird"

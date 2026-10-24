@@ -26,12 +26,7 @@ take a variable number of arguments, so a HOST given to those must be written
 `user@host` (the ssh form) to be told apart from APP; the other commands take
 it positionally whenever it is there.
 
-`init` is safe to re-run (refreshes the hook and symlink, nothing else). It never
-creates `env` — the hook refuses to deploy until step 2.
-
 ## Env vars
-
-`~/deploy/shared/<app>/env` is a systemd `EnvironmentFile`:
 
 ```sh
 ./deploy.sh env set HOST APP KEY=VALUE [KEY=VALUE ...]  # inline values
@@ -43,16 +38,10 @@ creates `env` — the hook refuses to deploy until step 2.
 ./deploy.sh env edit HOST APP                           # $EDITOR, then upload
 ```
 
-Values travel on ssh stdin only (never history or `ps`); writes are atomic, mode
-600, preserving comments and order. Changes restart the unit if present
-(`--no-restart` skips; no-op writes don't). Exit 1 missing key, 2 invalid input
-— nothing written.
-
 ## Server prerequisites (per host)
 
 - `systemd --user` with `loginctl enable-linger <user>`.
-- `uv` / `node`+`pnpm` on `%h/.local/bin:/usr/local/bin:/usr/bin:/bin` (pnpm
-  must honour the repo's `allowBuilds`/`allowScripts`).
+- `uv` / `node`+`pnpm`
 
 ## Layout
 
@@ -62,7 +51,7 @@ Values travel on ssh stdin only (never history or `ps`); writes are atomic, mode
 | `~/deploy/repos/<app>` | bare repo — the push target |
 | `~/deploy/live/<app>!<hash>` | one release dir per commit |
 | `~/deploy/live/<app>!CURRENT` | symlink to the deployed release; the unit's cwd |
-| `~/deploy/shared/<app>/env` | environment file, `EnvironmentFile=` in the unit |
+| `~/deploy/shared/<app>/env` | optional environment file, `EnvironmentFile=-` in the unit |
 | `~/deploy/shared/<app>/deploy.conf` | optional command overrides |
 | `~/.config/systemd/user/<app>.service` | generated; regenerated when it differs |
 

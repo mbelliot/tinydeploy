@@ -15,7 +15,7 @@
 #   ~/deploy/repos/<app>          bare repo (the push target)
 #   ~/deploy/live/<app>!<hash>    one release dir per commit
 #   ~/deploy/live/<app>!CURRENT   symlink -> the deployed release
-#   ~/deploy/shared/<app>/env     environment file, read by the unit
+#   ~/deploy/shared/<app>/env     optional environment file, read by the unit
 #   ~/deploy/shared/<app>/deploy.conf   optional command overrides (see below)
 #
 # Commands are detected from the tree: pnpm-lock.yaml -> pnpm install/build/start;
@@ -73,9 +73,11 @@ if ! command -v systemctl >/dev/null 2>&1; then
     die "systemctl not found; this hook assumes a systemd user session."
 fi
 
+# env is optional: an app with no configuration deploys without it. The
+# unit also carries the '-' prefix on EnvironmentFile=, so systemd starts it
+# whether or not the file exists - and picks it up once one does.
 if [ ! -f "$SHARED_ENV" ]; then
-    die "${SHARED_ENV} is missing - create it with the app's environment
-              (e.g. DATABASE_URL=...), then push again."
+    echo "post-receive: note: ${SHARED_ENV} is missing - deploying without it."
 fi
 
 mkdir -p "$LIVE_ROOT"
@@ -200,7 +202,7 @@ ExecStart=${EXEC}
 Restart=on-failure
 RestartSec=5
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-EnvironmentFile=${SHARED_ENV}
+EnvironmentFile=-${SHARED_ENV}
 ${UNIT_EXTRA}[Install]
 WantedBy=default.target
 "

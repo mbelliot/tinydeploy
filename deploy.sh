@@ -19,7 +19,7 @@
 #
 # init is the manual install from the README: dirs, bare repo, the shared hook
 # at ~/deploy/post-receive, and a symlink from the repo's hook to it. It does
-# not create env: the hook refuses to deploy until the file exists.
+# not create env: that file is optional, and the unit loads it only if present.
 #
 # env manages ~/deploy/shared/APP/env, a plain systemd EnvironmentFile, over
 # ssh. Values travel on stdin, never as command arguments, so they stay out of
@@ -392,7 +392,7 @@ cmd_init() {
     if ! run_remote "$INIT_SCRIPT" < "$HOOK"; then exit 1; fi
     cat <<EOF
 Initialized $APP on $HOST. Next:
-  1. env vars:  $0 env set $HOST $APP KEY=...
+  1. env vars (optional):  $0 env set $HOST $APP KEY=...
                 (or: $0 env import $HOST $APP FILE)
   2. push:      git remote add deploy $HOST:deploy/repos/$APP && git push deploy master
 EOF
