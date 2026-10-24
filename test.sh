@@ -52,6 +52,7 @@ case "$1" in
     if [ "${FAIL_BUILD:-}" = 1 ]; then echo "boom" >&2; exit 3; fi
     mkdir -p dist/server; echo "// built" > dist/server/entry.mjs
     ;;
+  fail) exit 7 ;;
 esac
 FAKE
 cat > "$SB/bin/node" <<'FAKE'
@@ -201,6 +202,85 @@ has "unit env from detection" "Environment=PYTHONUNBUFFERED=1" "$UNIT_P"
 is_file "app tree in release" "$REL_P/main.py"
 
 echo
+echo "=== 3b. deploy.conf commands are shell snippets ==="
+# Two commands in one BUILD is ordinary for an app that seeds its database
+# first. Without a shell the ';' word-splits onto the path and uv dies with
+# "Failed to spawn: scripts/seed.py;" instead of running both.
+make_repo multi
+mkdir -p "$SB/src/multi"
+git init -q -b master "$SB/src/multi"
+git -C "$SB/src/multi" config user.email t@example.com
+git -C "$SB/src/multi" config user.name Test
+printf 'print("hi")\n' > "$SB/src/multi/main.py"
+mkdir -p "$SB/src/multi/scripts"
+printf 'print("seed")\n' > "$SB/src/multi/scripts/seed.py"
+echo "version = 1" > "$SB/src/multi/uv.lock"
+cat > "$SB/shared/multi/deploy.conf" <<'CONF'
+AFTER_SYNC="echo after-one; echo after-two"
+BUILD="uv run scripts/seed.py; pnpm run build"
+CONF
+git -C "$SB/src/multi" add -A
+git -C "$SB/src/multi" commit -qm one
+out=$(git -C "$SB/src/multi" push "$SB/repos/multi" master 2>&1); rc=$?
+eq "multi-command deploy.conf: push succeeds" "$rc" 0
+case "$out" in *"DEPLOY FAILED"*) bad "multi-command deploy.conf deploys"; echo "$out" | sed 's/^/    | /' ;; *) ok "multi-command deploy.conf deploys" ;; esac
+has "BUILD's first command ran" "uv run scripts/seed.py" "$CALLS"
+has "BUILD's second command ran" "pnpm run build" "$CALLS"
+if grep -qF "scripts/seed.py;" "$CALLS"; then bad "semicolon split off the path"; else ok "semicolon split off the path"; fi
+case "$out" in *after-one*after-two*) ok "AFTER_SYNC ran both commands" ;; *) bad "AFTER_SYNC ran both commands"; echo "$out" | sed 's/^/    | /' ;; esac
+
+# -e inside the snippet: an early failure is the deploy's failure, and the
+# rest of the snippet never runs.
+make_repo multibad
+mkdir -p "$SB/src/multibad"
+git init -q -b master "$SB/src/multibad"
+git -C "$SB/src/multibad" config user.email t@example.com
+git -C "$SB/src/multibad" config user.name Test
+printf 'print("hi")\n' > "$SB/src/multibad/main.py"
+echo "version = 1" > "$SB/src/multibad/uv.lock"
+printf 'BUILD="pnpm fail; pnpm never"\n' > "$SB/shared/multibad/deploy.conf"
+git -C "$SB/src/multibad" add -A
+git -C "$SB/src/multibad" commit -qm one
+out=$(git -C "$SB/src/multibad" push "$SB/repos/multibad" master 2>&1)
+case "$out" in *"DEPLOY FAILED: build failed: pnpm fail; pnpm never"*) ok "multi-command BUILD names the snippet" ;; *) bad "multi-command BUILD names the snippet"; echo "$out" | sed 's/^/    | /' ;; esac
+if grep -qF "pnpm never" "$CALLS"; then bad "snippet stops at the first failure"; else ok "snippet stops at the first failure"; fi
+is_absent "failed snippet activates nothing" "$SB/live/multibad!CURRENT"
+
+echo
+echo "=== 3c. deploy-time commands see the app's env ==="
+# Only the unit used to get the shared env, so a seed script in BUILD ran with
+# no DATABASE_URL and libpq fell back to the server's own OS user.
+make_repo envapp
+mkdir -p "$SB/src/envapp"
+git init -q -b master "$SB/src/envapp"
+git -C "$SB/src/envapp" config user.email t@example.com
+git -C "$SB/src/envapp" config user.name Test
+printf 'print("hi")\n' > "$SB/src/envapp/main.py"
+echo "version = 1" > "$SB/src/envapp/uv.lock"
+printf 'AFTER_SYNC="printenv DATABASE_URL; printenv WEIRD"\n' > "$SB/shared/envapp/deploy.conf"
+git -C "$SB/src/envapp" add -A
+git -C "$SB/src/envapp" commit -qm one
+out=$(git -C "$SB/src/envapp" push "$SB/repos/envapp" master 2>&1)
+case "$out" in *"postgresql://sandbox/db"*) ok "deploy command sees DATABASE_URL" ;; *) bad "deploy command sees DATABASE_URL"; echo "$out" | sed 's/^/    | /' ;; esac
+
+# values are read literally, not sourced: '$' is a password character, not an
+# expansion, and a quote or '#' inside one survives.
+cat > "$SB/shared/envapp/env" <<'ENV'
+DATABASE_URL=postgresql://sandbox/db
+WEIRD="a b \"c\" #d $e 'f'"
+ENV
+git -C "$SB/src/envapp" commit -q --allow-empty -m weirdenv
+out=$(git -C "$SB/src/envapp" push "$SB/repos/envapp" master 2>&1)
+EXPECT_WEIRD="a b \"c\" #d \$e 'f'"
+if printf '%s' "$out" | grep -qF -- "$EXPECT_WEIRD"; then
+    ok "env value with quotes and \$ survives literally"
+else
+    bad "env value with quotes and \$ survives literally"; echo "$out" | sed 's/^/    | /'
+fi
+case "$out" in *"unbound variable"*|*"DEPLOY FAILED"*) bad "env value with \$ does not abort the deploy" ;; *) ok "env value with \$ does not abort the deploy" ;; esac
+printf 'DATABASE_URL=postgresql://sandbox/db\n' > "$SB/shared/envapp/env"
+
+echo
 echo "=== 4. failure paths ==="
 # env is optional: no env file still deploys, and the unit's EnvironmentFile=
 # carries the '-' prefix so systemd starts the app with the file absent.
@@ -247,13 +327,17 @@ is_absent "failed build activates nothing" "$SB/live/failapp!CURRENT"
 is_absent "failed build installs no unit" "$SB/home/.config/systemd/user/failapp.service"
 
 HF=$(git -C "$SB/repos/failapp" rev-parse --short master)
-is_dir "failed deploy leaves a half-made release" "$SB/live/failapp!$HF"
+is_absent "failed deploy drops its half-made release" "$SB/live/failapp!$HF"
+# wreckage from failures that died before this hook version existed is cleared
+# by the next push for that repo - and nobody else's dirs are touched
+mkdir -p "$SB/live/failapp!deadbee" "$SB/live/otherapp!cafe123"
 # the failed push already advanced the ref, so a retry needs a new commit
 git -C "$SB/src/failapp" commit -q --allow-empty -m redeploy
 git -C "$SB/src/failapp" push -q "$SB/repos/failapp" master
 HR=$(git -C "$SB/repos/failapp" rev-parse --short master)
 eq "retry deploys cleanly" "$(readlink -f "$SB/live/failapp!CURRENT")" "$SB/live/failapp!$HR"
-is_absent "failed deploy's orphan release pruned" "$SB/live/failapp!$HF"
+is_absent "stale release from an earlier failure pruned" "$SB/live/failapp!deadbee"
+is_dir "another repo's releases untouched" "$SB/live/otherapp!cafe123"
 
 echo
 echo "=== 6. deploy.sh init: fresh target, then a real push through it ==="
@@ -395,11 +479,20 @@ cat > "$SB/import.env" <<'EOF'
 FROMFILE=two words
 
 EMPTY=
+# dotenv quoting belongs to the file, not to the value
+SQUOTED='["a","b"]'
+DQUOTED="[\"a\",\"b\"]"
+PLAIN=no quotes here
 EOF
 out=$("$DEPLOY" env import eli@sg1 newapp "$SB/import.env" 2>&1); rc=$?
 eq "import exits 0" "$rc" 0
 eq "import applied a quoted value" "$("$DEPLOY" env get eli@sg1 newapp FROMFILE)" "two words"
 eq "import applied an empty value" "$("$DEPLOY" env get eli@sg1 newapp EMPTY)" ""
+# a JSON list in a dotenv file must reach the app as JSON, not as a quoted string
+eq "import strips single quotes" "$("$DEPLOY" env get eli@sg1 newapp SQUOTED)" '["a","b"]'
+eq "import strips double quotes and their escapes" "$("$DEPLOY" env get eli@sg1 newapp DQUOTED)" '["a","b"]'
+eq "import leaves an unquoted value alone" "$("$DEPLOY" env get eli@sg1 newapp PLAIN)" "no quotes here"
+has "imported JSON is stored as systemd-quoted JSON" 'SQUOTED="[\"a\",\"b\"]"' "$ENVFILE"
 if grep -q 'secrets for newapp' "$ENVFILE"; then bad "import does not copy comments"; else ok "import does not copy comments"; fi
 printf 'FROMSTDIN=1\n' | "$DEPLOY" env import eli@sg1 newapp - >/dev/null 2>&1; rc=$?
 eq "import from stdin exits 0" "$rc" 0
@@ -499,12 +592,16 @@ same "rm of missing conf key wrote nothing" "$SB/conf.before" "$CONF"
 
 # import: same file format as env import, allowlisted
 cat > "$SB/conf.import" <<'EOF'
-# commands from a file
-SYNC=pnpm install --frozen-lockfile
+# commands from a file (dotenv/shell quoting, as in the README)
+SYNC="pnpm install --frozen-lockfile"
+EXEC="node server.js"
+AFTER_SYNC="echo 'after sync'"
 EOF
 out=$("$DEPLOY" conf import eli@sg1 newapp "$SB/conf.import" 2>&1); rc=$?
 eq "conf import exits 0" "$rc" 0
 eq "conf import applied" "$("$DEPLOY" conf get eli@sg1 newapp SYNC)" "pnpm install --frozen-lockfile"
+eq "conf import strips the file's quoting" "$("$DEPLOY" conf get eli@sg1 newapp EXEC)" "node server.js"
+eq "conf import keeps a command's own quotes" "$("$DEPLOY" conf get eli@sg1 newapp AFTER_SYNC)" "echo 'after sync'"
 printf 'NOPE=1\n' > "$SB/conf.bad"
 cp "$CONF" "$SB/conf.before"
 "$DEPLOY" conf import eli@sg1 newapp "$SB/conf.bad" >/dev/null 2>&1; rc=$?

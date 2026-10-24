@@ -15,12 +15,17 @@
 #   ~/deploy/repos/<app>          bare repo (the push target)
 #   ~/deploy/live/<app>!<hash>    one release dir per commit
 #   ~/deploy/live/<app>!CURRENT   symlink -> the deployed release
-#   ~/deploy/shared/<app>/env     optional environment file, read by the unit
+#   ~/deploy/shared/<app>/env     optional environment file; unit + deploy commands
 #   ~/deploy/shared/<app>/deploy.conf   optional command overrides (see below)
 #
 # Commands are detected from the tree: pnpm-lock.yaml -> pnpm install/build/start;
 # uv.lock -> uv sync + .venv/bin/python main.py. Anything else goes in deploy.conf:
 #   SYNC="..."  AFTER_SYNC="..."  BUILD="..."  EXEC="..."  UNIT_ENV="A=1 B=2"
+#
+# SYNC, AFTER_SYNC and BUILD run through `sh -e -c` in the release dir, so they
+# are shell snippets: "uv run scripts/seed.py; pnpm build" runs both, and the
+# first failure stops the deploy. EXEC is an ExecStart= line and gets no shell -
+# one process, full paths (the unit's PATH has ~/.local/bin and /usr/bin).
 #
 # The unit is regenerated whenever its content changes, so editing deploy.conf
 # and re-pushing is enough - never hand-edit the unit.
@@ -30,6 +35,13 @@ set -eu
 # has to shout in the push output - and must never leave a half-made release.
 die() {
     echo "post-receive: DEPLOY FAILED: $1" >&2
+    # A failed deploy was never activated and nothing points at it, so it would
+    # only sit in live/ forever. Keep it only while it is CURRENT (re-pushing
+    # the deployed commit).
+    if [ -n "${LIVE_DIR:-}" ] && [ -d "$LIVE_DIR" ] \
+        && [ "$LIVE_DIR" != "${CURRENT_TARGET:-}" ]; then
+        rm -rf "$LIVE_DIR"
+    fi
     exit 1
 }
 
@@ -80,12 +92,70 @@ if [ ! -f "$SHARED_ENV" ]; then
     echo "post-receive: note: ${SHARED_ENV} is missing - deploying without it."
 fi
 
+# The deploy-time commands get the same variables the unit does, or a seed
+# script connects as the server's OS user with no password ("password
+# authentication failed for user <server user>") instead of the app's role.
+#
+# The file is a systemd EnvironmentFile, not a shell script: its values are
+# taken literally (deploy.sh writes `KEY=value`, double-quoted when the value
+# needs it). Sourcing it would expand a `$` inside a password or JWT secret.
+load_env() { # $1 path
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in '' | '#'* | ';'*) continue ;; esac
+        case $line in *=*) ;; *) continue ;; esac
+        key=${line%%=*}
+        # systemd allows nothing but a plain name here; anything else is a
+        # hand-edited line that systemd would reject too, so skip it.
+        case $key in [A-Za-z_]*) ;; *) continue ;; esac
+        case $key in *[!A-Za-z0-9_]*) continue ;; esac
+        val=${line#*=}
+        case $val in
+            \"*\")
+                val=${val#\"}
+                val=${val%\"}
+                # undo the double-quoting encode_value applies: \\ -> \, \" -> "
+                unq=""
+                while [ -n "$val" ]; do
+                    c=${val%"${val#?}"}
+                    val=${val#?}
+                    if [ "$c" = '\' ] && [ -n "$val" ]; then
+                        c=${val%"${val#?}"}
+                        val=${val#?}
+                    fi
+                    unq=$unq$c
+                done
+                val=$unq
+                ;;
+            \'*\')
+                val=${val#\'}
+                val=${val%\'}
+                ;;
+        esac
+        export "$key=$val"
+    done < "$1"
+}
+
+if [ -f "$SHARED_ENV" ]; then
+    load_env "$SHARED_ENV"
+fi
+
 mkdir -p "$LIVE_ROOT"
 
 CURRENT_TARGET=""
 if [ -L "$LIVE_DIR_CURR" ]; then
     CURRENT_TARGET=$(readlink -f "$LIVE_DIR_CURR")
 fi
+
+# Clear the wreckage of earlier failed pushes before building: those releases
+# were never activated, so nothing but this loop will ever remove them. Runs on
+# every push, so a run of failures cannot pile up dirs for this repo.
+for dir in "$LIVE_ROOT/${REPO_NAME}"!*; do
+    case $dir in *"!CURRENT") continue ;; esac
+    if [ ! -d "$dir" ]; then continue; fi
+    if [ "$dir" = "$LIVE_DIR" ] || [ "$dir" = "$CURRENT_TARGET" ]; then continue; fi
+    echo "Removing stale release $(basename "$dir")..."
+    rm -rf "$dir"
+done
 
 # Re-pushing the deployed commit reuses its release dir, and checkout -f leaves
 # files that commit deleted. Clear it first - never while it is CURRENT.
@@ -163,25 +233,25 @@ for var in SYNC EXEC; do
     fi
 done
 
+# deploy.conf commands are shell snippets, so they get a shell: expanding them
+# unquoted would leave a ';' glued to the first word ("Failed to spawn:
+# scripts/seed.py;") instead of separating two commands. -e stops at the first
+# failure, so "a; b" fails the deploy when a does.
+run_cmd() { # label, command
+    if ! sh -e -c "$2"; then
+        die "$1 failed: $2"
+    fi
+}
+
 cd "$LIVE_DIR"
 echo "Syncing deps (${RUNTIME})..."
-# Command strings are intentionally unquoted: they carry their own arguments.
-# shellcheck disable=SC2086
-if ! $SYNC; then
-    die "sync failed: ${SYNC}"
-fi
+run_cmd sync "$SYNC"
 if [ -n "${AFTER_SYNC:-}" ]; then
-    # shellcheck disable=SC2086
-    if ! $AFTER_SYNC; then
-        die "AFTER_SYNC failed: ${AFTER_SYNC}"
-    fi
+    run_cmd AFTER_SYNC "$AFTER_SYNC"
 fi
 if [ -n "${BUILD:-}" ]; then
     echo "Building..."
-    # shellcheck disable=SC2086
-    if ! $BUILD; then
-        die "build failed: ${BUILD}"
-    fi
+    run_cmd build "$BUILD"
 fi
 
 # --- systemd user unit (regenerated when it differs) -------------------------

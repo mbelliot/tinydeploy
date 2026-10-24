@@ -132,6 +132,41 @@ is_host_arg() {
     esac
 }
 
+# Decode the escapes dotenv allows inside a double-quoted value: \\ and \".
+# Any other backslash stays as written, and no expansion is done here.
+unescape_dq() {
+    printf '%s' "$1" | awk '{
+        out = ""; n = length($0); i = 1
+        while (i <= n) {
+            c = substr($0, i, 1)
+            if (c == "\\" && i < n) {
+                d = substr($0, i + 1, 1)
+                if (d == "\\" || d == "\"") { out = out d; i += 2; continue }
+            }
+            out = out c; i += 1
+        }
+        printf "%s", out
+    }'
+}
+
+# A dotenv file may quote a value (KEY="..." or KEY='...'). That quoting belongs
+# to the file, not to the secret: strip one matching pair, so `KEY='["a"]'`
+# stores the JSON rather than a string with quotes in it.
+unquote_value() {
+    case $1 in
+        \"*\")
+            v=${1#\"}
+            v=${v%\"}
+            unescape_dq "$v"
+            ;;
+        \'*\')
+            v=${1#\'}
+            printf '%s' "${v%\'}"
+            ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 # Encode as a systemd EnvironmentFile token: bare when obviously safe,
 # otherwise double-quoted with backslashes and quotes escaped.
 encode_value() {
@@ -559,7 +594,7 @@ cmd_env_import() {
             *) bad "line $lineno: expected KEY=value: $line" ;;
         esac
         key=${line%%=*}
-        value=${line#*=}
+        value=$(unquote_value "${line#*=}")
         valid_key "$key" || bad "line $lineno: invalid key: $key"
         printf '%s=%s\n' "$key" "$(encode_value "$value")" >> "$pairs"
         keys="$keys $key"
@@ -736,7 +771,9 @@ cmd_conf_import() {
             *) bad "line $lineno: expected KEY=value: $line" ;;
         esac
         key=${line%%=*}
-        value=${line#*=}
+        # KEY="..." / KEY='...' in the file is quoting, as in the README example;
+        # keeping it would store the quotes as part of the command.
+        value=$(unquote_value "${line#*=}")
         valid_key "$key" || bad "line $lineno: invalid key: $key"
         conf_key_ok "$key" || bad "line $lineno: not a deploy.conf key: $key (one of:${CONF_KEYS% })"
         printf '%s=%s\n' "$key" "$(encode_sh "$value")" >> "$pairs"
