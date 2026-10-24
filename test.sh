@@ -405,5 +405,121 @@ case "$out" in *"No changes."*) ok "no-op edit prints No changes." ;; *) bad "no
 eq "no-op edit restarts nothing" "$(grep -c 'restart newapp.service' "$CALLS")" "$restarts_before"
 
 echo
+echo "=== 8. deploy.sh conf: managed deploy.conf ==="
+CONF="$ISB/shared/newapp/deploy.conf"
+restarts_before=$(grep -c "restart newapp.service" "$CALLS" || true)
+# Hand-written file: the comment and the old quoting must survive a managed write.
+cat > "$CONF" <<'CONFEOF'
+# host-specific tweaks
+BUILD="pnpm build --verbose"
+CONFEOF
+chmod 600 "$CONF"
+
+out=$("$DEPLOY" conf set eli@sg1 newapp EXEC="node server.js" 'UNIT_ENV=PORT={shared}/port' 2>&1); rc=$?
+eq "conf set exits 0" "$rc" 0
+case "$out" in *"Set EXEC."*"Set UNIT_ENV."*) ok "conf set names the keys" ;; *) bad "conf set names the keys"; echo "$out" | sed 's/^/    | /' ;; esac
+eq "conf get returns the command" "$("$DEPLOY" conf get eli@sg1 newapp EXEC)" "node server.js"
+eq "conf get returns placeholders verbatim" "$("$DEPLOY" conf get eli@sg1 newapp UNIT_ENV)" "PORT={shared}/port"
+eq "deploy.conf is 600" "$(stat -c %a "$CONF")" 600
+has "hand-written comment survives" "host-specific tweaks" "$CONF"
+has "hand-written line survives" 'BUILD="pnpm build --verbose"' "$CONF"
+case "$("$DEPLOY" conf ls eli@sg1 newapp)" in
+    *BUILD*EXEC*UNIT_ENV*) ok "conf ls lists overridden keys" ;;
+    *) bad "conf ls lists overridden keys" ;;
+esac
+eq "conf changes restart nothing" "$(grep -c 'restart newapp.service' "$CALLS")" "$restarts_before"
+
+# a value carrying a single quote round-trips through the sh encoding
+"$DEPLOY" conf set eli@sg1 newapp "AFTER_SYNC=echo 'after sync'" >/dev/null 2>&1
+out=$("$DEPLOY" conf get eli@sg1 newapp AFTER_SYNC)
+eq "quoted command round-trips" "$out" "echo 'after sync'"
+if grep -q "^AFTER_SYNC='" "$CONF"; then ok "command stored single-quoted"; else bad "command stored single-quoted"; fi
+
+# re-set replaces the line in place; a no-op uploads and restarts nothing
+"$DEPLOY" conf set eli@sg1 newapp 'BUILD=pnpm build' >/dev/null 2>&1
+eq "re-set replaces the value" "$("$DEPLOY" conf get eli@sg1 newapp BUILD)" "pnpm build"
+eq "re-set does not duplicate the key" "$(grep -c '^BUILD=' "$CONF")" 1
+has "comment survives a re-set" "host-specific tweaks" "$CONF"
+out=$("$DEPLOY" conf set eli@sg1 newapp 'BUILD=pnpm build' 2>&1)
+case "$out" in *"No changes."*) ok "no-op conf set prints No changes." ;; *) bad "no-op conf set prints No changes." ;; esac
+eq "no-op conf set restarts nothing" "$(grep -c 'restart newapp.service' "$CALLS")" "$restarts_before"
+
+# unknown keys and syntax errors are refused before anything is uploaded
+cp "$CONF" "$SB/conf.before"
+out=$("$DEPLOY" conf set eli@sg1 newapp EXE=nope 2>&1); rc=$?
+eq "unknown conf key exits 2" "$rc" 2
+same "unknown conf key wrote nothing" "$SB/conf.before" "$CONF"
+case "$out" in *"not a deploy.conf key"*) ok "unknown key named in error" ;; *) bad "unknown key named in error" ;; esac
+cat > "$SB/bin/badconf" <<'FAKE'
+#!/bin/sh
+echo 'EXEC="unclosed' > "$1"
+FAKE
+chmod +x "$SB/bin/badconf"
+out=$(EDITOR="$SB/bin/badconf" "$DEPLOY" conf edit eli@sg1 newapp 2>&1); rc=$?
+eq "syntax-broken edit exits 2" "$rc" 2
+same "syntax-broken edit wrote nothing" "$SB/conf.before" "$CONF"
+case "$out" in *"syntax error"*) ok "syntax error named in error" ;; *) bad "syntax error named in error" ;; esac
+
+# edit warns about keys this hook does not read, but keeps them
+cat > "$SB/bin/extraconf" <<'FAKE'
+#!/bin/sh
+echo 'DATA_DIR=/srv/data' >> "$1"
+FAKE
+chmod +x "$SB/bin/extraconf"
+out=$(EDITOR="$SB/bin/extraconf" "$DEPLOY" conf edit eli@sg1 newapp 2>&1); rc=$?
+eq "edit with an unmanaged key exits 0" "$rc" 0
+case "$out" in *"DATA_DIR is not read by the hook"*) ok "unmanaged key is warned about" ;; *) bad "unmanaged key is warned about"; echo "$out" | sed 's/^/    | /' ;; esac
+eq "edit uploads the unmanaged key" "$("$DEPLOY" conf get eli@sg1 newapp DATA_DIR)" "/srv/data"
+
+# rm: a managed key goes, a missing one refuses without writing
+"$DEPLOY" conf rm eli@sg1 newapp DATA_DIR >/dev/null 2>&1; rc=$?
+eq "conf rm exits 0" "$rc" 0
+"$DEPLOY" conf get eli@sg1 newapp DATA_DIR >/dev/null 2>&1; rc=$?
+eq "removed conf key is gone" "$rc" 1
+cp "$CONF" "$SB/conf.before"
+"$DEPLOY" conf rm eli@sg1 newapp NOPE >/dev/null 2>&1; rc=$?
+eq "rm of missing conf key exits 1" "$rc" 1
+same "rm of missing conf key wrote nothing" "$SB/conf.before" "$CONF"
+
+# import: same file format as env import, allowlisted
+cat > "$SB/conf.import" <<'EOF'
+# commands from a file
+SYNC=pnpm install --frozen-lockfile
+EOF
+out=$("$DEPLOY" conf import eli@sg1 newapp "$SB/conf.import" 2>&1); rc=$?
+eq "conf import exits 0" "$rc" 0
+eq "conf import applied" "$("$DEPLOY" conf get eli@sg1 newapp SYNC)" "pnpm install --frozen-lockfile"
+printf 'NOPE=1\n' > "$SB/conf.bad"
+cp "$CONF" "$SB/conf.before"
+"$DEPLOY" conf import eli@sg1 newapp "$SB/conf.bad" >/dev/null 2>&1; rc=$?
+eq "unknown import key exits 2" "$rc" 2
+same "unknown import key wrote nothing" "$SB/conf.before" "$CONF"
+
+out=$("$DEPLOY" conf show eli@sg1 newapp)
+case "$out" in *"host-specific tweaks"*"SYNC="*) ok "conf show prints the file" ;; *) bad "conf show prints the file" ;; esac
+eq "no conf command restarted the service" "$(grep -c 'restart newapp.service' "$CALLS")" "$restarts_before"
+
+out=$("$DEPLOY" conf show eli@sg1 ghost 2>&1); rc=$?
+eq "conf on an uninitialized app exits 1" "$rc" 1
+case "$out" in *"not initialized"*) ok "conf names the uninitialized app" ;; *) bad "conf names the uninitialized app" ;; esac
+
+# the change lands with the next push, not with the command
+push_out=$(git -C "$SB/src/newapp" commit -q --allow-empty -m conf && git -C "$SB/src/newapp" push "$IREPO" master 2>&1)
+HCONF=$(git -C "$IREPO" rev-parse --short master)
+case "$push_out" in *"after sync"*) ok "conf AFTER_SYNC ran on push" ;; *) bad "conf AFTER_SYNC ran on push"; echo "$push_out" | sed 's/^/    | /' ;; esac
+UNIT_I="$SB/home/.config/systemd/user/newapp.service"
+has "conf EXEC reaches the unit" "ExecStart=node server.js" "$UNIT_I"
+has "conf UNIT_ENV placeholder expanded on deploy" "Environment=PORT=$ISB/shared/newapp/port" "$UNIT_I"
+case "$(cat "$UNIT_I")" in *"ExecStart=$SB/bin/pnpm start"*) bad "conf EXEC overrides detection" ;; *) ok "conf EXEC overrides detection" ;; esac
+case "$(cat "$UNIT_I")" in *"Environment=NODE_ENV=production"*) bad "conf UNIT_ENV overrides detection" ;; *) ok "conf UNIT_ENV overrides detection" ;; esac
+
+# a hand-broken file fails the push loudly and activates nothing
+printf 'EXEC="unclosed\n' > "$CONF"
+git -C "$SB/src/newapp" commit -q --allow-empty -m broken
+out=$(git -C "$SB/src/newapp" push "$IREPO" master 2>&1)
+case "$out" in *"DEPLOY FAILED: syntax error in"*) ok "broken deploy.conf fails the push" ;; *) bad "broken deploy.conf fails the push"; echo "$out" | sed 's/^/    | /' ;; esac
+eq "broken deploy.conf activates nothing" "$(readlink -f "$ISB/live/newapp!CURRENT")" "$ISB/live/newapp!$HCONF"
+
+echo
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "FAILURES PRESENT"; fi
 exit "$fail"

@@ -126,10 +126,15 @@ else
               ${SHARED_CONF} if this is intentional."
 fi
 
-# Optional per-repo overrides win over detection.
+# Optional per-repo overrides win over detection. Check the syntax first so a
+# broken deploy.conf reads as a deploy failure naming the file, instead of a
+# bare `set -e` exit from the dot command.
 if [ -f "$SHARED_CONF" ]; then
+    if ! CONF_ERR=$(sh -n "$SHARED_CONF" 2>&1); then
+        die "syntax error in ${SHARED_CONF}: ${CONF_ERR}"
+    fi
     # shellcheck disable=SC1090
-    . "$SHARED_CONF"
+    . "$SHARED_CONF" || die "could not source ${SHARED_CONF}"
 fi
 
 # {repo} {hash} {root} {live} {live_curr} {shared} expand in commands and env,

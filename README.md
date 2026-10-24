@@ -61,7 +61,23 @@ Values travel on ssh stdin only (never history or `ps`); writes are atomic, mode
 | `uv.lock` | `uv sync --locked --no-dev` | — | `.venv/bin/python main.py` |
 
 Anything else goes in `~/deploy/shared/<app>/deploy.conf` (server-side,
-`sh`-sourced):
+`sh`-sourced), managed from the desktop like env:
+
+```sh
+./deploy.sh conf set HOST APP EXEC=".venv/bin/python main.py"
+./deploy.sh conf set HOST APP BUILD="pnpm build" UNIT_ENV="A=1 DATA_DIR={shared}/data"
+./deploy.sh conf get|ls|rm|import|edit|show HOST APP ...
+```
+
+`conf set` and `conf import` accept only the five keys below, so an `EXE=` typo
+fails (exit 2) instead of sitting in the file doing nothing; `conf rm` removes
+any key, including hand-written ones. Values are stored verbatim as single-quoted
+shell words — no `$VAR` expansion server-side, `{...}` placeholders still apply —
+and only the touched line is rewritten, so comments and ordering survive. The
+merged file is `sh -n`-checked before upload; `conf edit` checks it too and only
+warns about extra keys. Nothing restarts: the hook re-reads the file on the next
+push, and a changed SYNC/AFTER_SYNC/BUILD/EXEC/UNIT_ENV regenerates the unit
+then.
 
 ```sh
 SYNC="uv sync --locked --no-dev"
