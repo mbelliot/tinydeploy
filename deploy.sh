@@ -2,16 +2,20 @@
 #
 # deploy.sh - one script for an app's deploy target and its environment file.
 #
-#   ./deploy.sh init HOST APP
-#   ./deploy.sh env set HOST APP KEY=VALUE [KEY=VALUE ...]
-#   ./deploy.sh env set HOST APP KEY [KEY ...]        (prompts, hidden)
-#   ./deploy.sh env get HOST APP KEY
-#   ./deploy.sh env ls HOST APP
-#   ./deploy.sh env rm HOST APP KEY [KEY ...]
-#   ./deploy.sh env import HOST APP FILE|-            (KEY=value lines)
-#   ./deploy.sh env edit HOST APP                     ($EDITOR, then upload)
-#   ./deploy.sh conf set HOST APP KEY=VALUE [...]     (SYNC AFTER_SYNC BUILD EXEC UNIT_ENV)
-#   ./deploy.sh conf get|ls|rm|import|edit|show HOST APP ...
+#   ./deploy.sh init [HOST] APP
+#   ./deploy.sh env set [HOST] APP KEY=VALUE [KEY=VALUE ...]
+#   ./deploy.sh env set [HOST] APP KEY [KEY ...]      (prompts, hidden)
+#   ./deploy.sh env get [HOST] APP KEY
+#   ./deploy.sh env ls [HOST] APP
+#   ./deploy.sh env rm [HOST] APP KEY [KEY ...]
+#   ./deploy.sh env import [HOST] APP FILE|-          (KEY=value lines)
+#   ./deploy.sh env edit [HOST] APP                   ($EDITOR, then upload)
+#   ./deploy.sh conf set [HOST] APP KEY=VALUE [...]   (SYNC AFTER_SYNC BUILD EXEC UNIT_ENV)
+#   ./deploy.sh conf get|ls|rm|import|edit|show [HOST] APP ...
+#
+# HOST is optional when TINYDEPLOY_HOST is set; an explicit HOST wins. The
+# variadic commands (env/conf set and rm) cannot tell HOST from APP by count,
+# so a HOST given to those must look like an ssh destination (user@host).
 #
 # init is the manual install from the README: dirs, bare repo, the shared hook
 # at ~/deploy/post-receive, and a symlink from the repo's hook to it. It does
@@ -34,21 +38,24 @@ set -eu
 
 usage() {
     cat >&2 <<'EOF'
-usage: deploy.sh init HOST APP
-       deploy.sh env set [--no-restart] HOST APP KEY=VALUE [KEY=VALUE ...]
-       deploy.sh env set [--no-restart] HOST APP KEY [KEY ...]     (hidden prompt)
-       deploy.sh env get HOST APP KEY
-       deploy.sh env ls HOST APP
-       deploy.sh env rm [--no-restart] HOST APP KEY [KEY ...]
-       deploy.sh env import [--no-restart] HOST APP FILE|-         (KEY=value lines)
-       deploy.sh env edit [--no-restart] HOST APP
-       deploy.sh conf set HOST APP KEY=VALUE [KEY=VALUE ...]
-       deploy.sh conf get HOST APP KEY
-       deploy.sh conf ls HOST APP
-       deploy.sh conf rm HOST APP KEY [KEY ...]
-       deploy.sh conf import HOST APP FILE|-                      (KEY=value lines)
-       deploy.sh conf edit HOST APP                              ($EDITOR, then upload)
-       deploy.sh conf show HOST APP
+usage: deploy.sh init [HOST] APP
+       deploy.sh env set [--no-restart] [HOST] APP KEY=VALUE [KEY=VALUE ...]
+       deploy.sh env set [--no-restart] [HOST] APP KEY [KEY ...]     (hidden prompt)
+       deploy.sh env get [HOST] APP KEY
+       deploy.sh env ls [HOST] APP
+       deploy.sh env rm [--no-restart] [HOST] APP KEY [KEY ...]
+       deploy.sh env import [--no-restart] [HOST] APP FILE|-         (KEY=value lines)
+       deploy.sh env edit [--no-restart] [HOST] APP
+       deploy.sh conf set [HOST] APP KEY=VALUE [KEY=VALUE ...]
+       deploy.sh conf get [HOST] APP KEY
+       deploy.sh conf ls [HOST] APP
+       deploy.sh conf rm [HOST] APP KEY [KEY ...]
+       deploy.sh conf import [HOST] APP FILE|-                      (KEY=value lines)
+       deploy.sh conf edit [HOST] APP                              ($EDITOR, then upload)
+       deploy.sh conf show [HOST] APP
+
+HOST may be omitted when TINYDEPLOY_HOST is set; an explicit HOST wins. For
+env/conf set and rm, an explicit HOST must be user@host to be told from APP.
 EOF
     exit "${1:-2}"
 }
@@ -101,6 +108,27 @@ valid_key() {
 check_value() { # $1 key, $2 value
     case "$2" in
         *"$NL"* | *"$CR"*) bad "value for $1 must be a single line" ;;
+    esac
+}
+
+# HOST comes from the command line when given (it wins) or TINYDEPLOY_HOST.
+set_host() { # $1 explicit HOST, empty when omitted
+    if [ -n "${1:-}" ]; then
+        HOST=$1
+    elif [ -n "${TINYDEPLOY_HOST:-}" ]; then
+        HOST=$TINYDEPLOY_HOST
+    else
+        bad "no HOST given and TINYDEPLOY_HOST is unset"
+    fi
+}
+
+# env/conf set and rm take a variable number of KEYs, so the argument count
+# cannot say whether HOST was passed. With TINYDEPLOY_HOST set an explicit
+# HOST is recognised by the ssh user@host form; anything else is read as APP.
+is_host_arg() {
+    case "$1" in
+        *@*) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -351,8 +379,11 @@ conf_note() {
 
 # --- commands ----------------------------------------------------------------
 cmd_init() {
-    [ $# -eq 2 ] || usage 2
-    HOST=$1 APP=$2
+    case $# in
+        1) set_host ""; APP=$1 ;;
+        2) set_host "$1"; APP=$2 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
     HOOK=$(cd "$(dirname "$0")" && pwd)/post-receive
     if [ ! -f "$HOOK" ]; then
@@ -368,9 +399,17 @@ EOF
 }
 
 cmd_env_set() {
-    [ $# -ge 3 ] || usage 2
-    HOST=$1 APP=$2
-    shift 2
+    if [ -n "${TINYDEPLOY_HOST:-}" ] && { [ $# -lt 3 ] || ! is_host_arg "$1"; }; then
+        [ $# -ge 2 ] || usage 2
+        set_host ""
+        APP=$1
+        shift
+    else
+        [ $# -ge 3 ] || usage 2
+        set_host "$1"
+        APP=$2
+        shift 2
+    fi
     check_app "$APP"
     new_tmp; pairs=$NEWTMP
     keys=""
@@ -406,9 +445,17 @@ cmd_env_set() {
 }
 
 cmd_env_rm() {
-    [ $# -ge 3 ] || usage 2
-    HOST=$1 APP=$2
-    shift 2
+    if [ -n "${TINYDEPLOY_HOST:-}" ] && { [ $# -lt 3 ] || ! is_host_arg "$1"; }; then
+        [ $# -ge 2 ] || usage 2
+        set_host ""
+        APP=$1
+        shift
+    else
+        [ $# -ge 3 ] || usage 2
+        set_host "$1"
+        APP=$2
+        shift 2
+    fi
     check_app "$APP"
     new_tmp; keysf=$NEWTMP
     keys=""
@@ -427,10 +474,12 @@ cmd_env_rm() {
 }
 
 cmd_env_get() {
-    [ $# -eq 3 ] || usage 2
-    HOST=$1 APP=$2
+    case $# in
+        2) set_host ""; APP=$1; key=$2 ;;
+        3) set_host "$1"; APP=$2; key=$3 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
-    key=$3
     valid_key "$key" || bad "invalid key: $key"
     new_tmp; f=$NEWTMP
     if ! fetch_file env > "$f"; then exit 1; fi
@@ -460,8 +509,11 @@ cmd_env_get() {
 }
 
 cmd_env_ls() {
-    [ $# -eq 2 ] || usage 2
-    HOST=$1 APP=$2
+    case $# in
+        1) set_host ""; APP=$1 ;;
+        2) set_host "$1"; APP=$2 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
     new_tmp; f=$NEWTMP
     if ! fetch_file env > "$f"; then exit 1; fi
@@ -469,9 +521,11 @@ cmd_env_ls() {
 }
 
 cmd_env_import() {
-    [ $# -eq 3 ] || usage 2
-    HOST=$1 APP=$2
-    src=$3
+    case $# in
+        2) set_host ""; APP=$1; src=$2 ;;
+        3) set_host "$1"; APP=$2; src=$3 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
     if [ "$src" = "-" ]; then
         file=/dev/stdin
@@ -511,8 +565,11 @@ cmd_env_import() {
 }
 
 cmd_env_edit() {
-    [ $# -eq 2 ] || usage 2
-    HOST=$1 APP=$2
+    case $# in
+        1) set_host ""; APP=$1 ;;
+        2) set_host "$1"; APP=$2 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
     new_tmp; oldf=$NEWTMP
     new_tmp; newf=$NEWTMP
@@ -545,9 +602,17 @@ cmd_env_edit() {
 }
 
 cmd_conf_set() {
-    [ $# -ge 3 ] || usage 2
-    HOST=$1 APP=$2
-    shift 2
+    if [ -n "${TINYDEPLOY_HOST:-}" ] && { [ $# -lt 3 ] || ! is_host_arg "$1"; }; then
+        [ $# -ge 2 ] || usage 2
+        set_host ""
+        APP=$1
+        shift
+    else
+        [ $# -ge 3 ] || usage 2
+        set_host "$1"
+        APP=$2
+        shift 2
+    fi
     check_app "$APP"
     new_tmp; pairs=$NEWTMP
     keys=""
@@ -574,10 +639,12 @@ cmd_conf_set() {
 }
 
 cmd_conf_get() {
-    [ $# -eq 3 ] || usage 2
-    HOST=$1 APP=$2
+    case $# in
+        2) set_host ""; APP=$1; key=$2 ;;
+        3) set_host "$1"; APP=$2; key=$3 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
-    key=$3
     valid_key "$key" || bad "invalid key: $key"
     new_tmp; f=$NEWTMP
     if ! fetch_file deploy.conf > "$f"; then exit 1; fi
@@ -590,8 +657,11 @@ cmd_conf_get() {
 }
 
 cmd_conf_ls() {
-    [ $# -eq 2 ] || usage 2
-    HOST=$1 APP=$2
+    case $# in
+        1) set_host ""; APP=$1 ;;
+        2) set_host "$1"; APP=$2 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
     new_tmp; f=$NEWTMP
     if ! fetch_file deploy.conf > "$f"; then exit 1; fi
@@ -599,9 +669,17 @@ cmd_conf_ls() {
 }
 
 cmd_conf_rm() {
-    [ $# -ge 3 ] || usage 2
-    HOST=$1 APP=$2
-    shift 2
+    if [ -n "${TINYDEPLOY_HOST:-}" ] && { [ $# -lt 3 ] || ! is_host_arg "$1"; }; then
+        [ $# -ge 2 ] || usage 2
+        set_host ""
+        APP=$1
+        shift
+    else
+        [ $# -ge 3 ] || usage 2
+        set_host "$1"
+        APP=$2
+        shift 2
+    fi
     check_app "$APP"
     new_tmp; keysf=$NEWTMP
     keys=""
@@ -620,9 +698,11 @@ cmd_conf_rm() {
 }
 
 cmd_conf_import() {
-    [ $# -eq 3 ] || usage 2
-    HOST=$1 APP=$2
-    src=$3
+    case $# in
+        2) set_host ""; APP=$1; src=$2 ;;
+        3) set_host "$1"; APP=$2; src=$3 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
     if [ "$src" = "-" ]; then
         file=/dev/stdin
@@ -663,8 +743,11 @@ cmd_conf_import() {
 }
 
 cmd_conf_edit() {
-    [ $# -eq 2 ] || usage 2
-    HOST=$1 APP=$2
+    case $# in
+        1) set_host ""; APP=$1 ;;
+        2) set_host "$1"; APP=$2 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
     new_tmp; oldf=$NEWTMP
     new_tmp; newf=$NEWTMP
@@ -685,8 +768,11 @@ cmd_conf_edit() {
 }
 
 cmd_conf_show() {
-    [ $# -eq 2 ] || usage 2
-    HOST=$1 APP=$2
+    case $# in
+        1) set_host ""; APP=$1 ;;
+        2) set_host "$1"; APP=$2 ;;
+        *) usage 2 ;;
+    esac
     check_app "$APP"
     new_tmp; f=$NEWTMP
     if ! fetch_file deploy.conf > "$f"; then exit 1; fi

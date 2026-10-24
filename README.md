@@ -13,6 +13,19 @@ git remote add deploy eli@sg1:deploy/repos/framer
 git push deploy master
 ```
 
+`TINYDEPLOY_HOST` stands in for HOST on every command, so it can be left out:
+
+```sh
+export TINYDEPLOY_HOST=eli@sg1
+./deploy.sh init framer
+./deploy.sh env set framer DATABASE_URL=postgresql://...
+```
+
+A HOST passed on the command line still wins. `env set|rm` and `conf set|rm`
+take a variable number of arguments, so a HOST given to those must be written
+`user@host` (the ssh form) to be told apart from APP; the other commands take
+it positionally whenever it is there.
+
 `init` is safe to re-run (refreshes the hook and symlink, nothing else). It never
 creates `env` — the hook refuses to deploy until step 2.
 

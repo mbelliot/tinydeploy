@@ -521,5 +521,59 @@ case "$out" in *"DEPLOY FAILED: syntax error in"*) ok "broken deploy.conf fails 
 eq "broken deploy.conf activates nothing" "$(readlink -f "$ISB/live/newapp!CURRENT")" "$ISB/live/newapp!$HCONF"
 
 echo
+echo "=== 9. HOST from TINYDEPLOY_HOST ==="
+# The variable stands in for HOST; an explicit HOST still wins. The stub ssh
+# runs locally, so the sandbox paths are shared - the calls log proves which
+# host each command asked for.
+out=$(TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" init envhost 2>&1); rc=$?
+eq "env host: init exits 0" "$rc" 0
+eq "env host: init ssh'd there" "$(tail -n 1 "$CALLS")" "ssh eli@sg9"
+is_dir "env host: repo created" "$ISB/repos/envhost"
+case "$out" in *"Initialized envhost on eli@sg9."*) ok "env host: init names the host" ;; *) bad "env host: init names the host"; echo "$out" | sed 's/^/    | /' ;; esac
+
+out=$(TINYDEPLOY_HOST=wrong@host "$DEPLOY" init eli@sg1 argapp 2>&1); rc=$?
+eq "explicit HOST: init exits 0" "$rc" 0
+eq "explicit HOST: init ssh'd there" "$(tail -n 1 "$CALLS")" "ssh eli@sg1"
+case "$out" in *"Initialized argapp on eli@sg1."*) ok "explicit HOST: named in output" ;; *) bad "explicit HOST: named in output" ;; esac
+
+# fixed-shape commands: APP first when the variable is set
+TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" env set envhost DATABASE_URL=postgresql://sandbox/db >/dev/null 2>&1; rc=$?
+eq "env host: env set exits 0" "$rc" 0
+eq "env host: env set ssh'd there" "$(tail -n 1 "$CALLS")" "ssh eli@sg9"
+eq "env host: env set wrote the value" "$(cat "$ISB/shared/envhost/env")" "DATABASE_URL=postgresql://sandbox/db"
+eq "env host: env get reads it back" "$(TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" env get envhost DATABASE_URL)" "postgresql://sandbox/db"
+TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" env set --no-restart envhost DELTA=4 >/dev/null 2>&1; rc=$?
+eq "env host: --no-restart with omitted HOST" "$rc" 0
+
+# variadic commands: APP first, or user@host first to override the variable
+TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" env set envhost ALPHA=1 BETA=2 >/dev/null 2>&1; rc=$?
+eq "env host: variadic env set exits 0" "$rc" 0
+eq "env host: variadic env set wrote ALPHA" "$(TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" env get envhost ALPHA)" 1
+eq "env host: variadic env set wrote BETA" "$(TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" env get envhost BETA)" 2
+TINYDEPLOY_HOST=wrong@host "$DEPLOY" env set eli@sg2 envhost GAMMA=3 >/dev/null 2>&1; rc=$?
+eq "explicit HOST: variadic set exits 0" "$rc" 0
+eq "explicit HOST: variadic set ssh'd there" "$(tail -n 1 "$CALLS")" "ssh eli@sg2"
+eq "explicit HOST: variadic set wrote the value" "$(TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" env get envhost GAMMA)" 3
+TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" env rm envhost ALPHA >/dev/null 2>&1; rc=$?
+eq "env host: variadic rm exits 0" "$rc" 0
+TINYDEPLOY_HOST= "$DEPLOY" env get eli@sg9 envhost ALPHA >/dev/null 2>&1; rc=$?
+eq "env host: variadic rm removed the key" "$rc" 1
+
+# conf: fixed and variadic forms
+TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" conf set envhost EXEC="node server.js" >/dev/null 2>&1; rc=$?
+eq "env host: conf set exits 0" "$rc" 0
+eq "env host: conf get reads it back" "$(TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" conf get envhost EXEC)" "node server.js"
+TINYDEPLOY_HOST=wrong@host "$DEPLOY" conf rm eli@sg3 envhost EXEC >/dev/null 2>&1; rc=$?
+eq "explicit HOST: variadic conf rm exits 0" "$rc" 0
+eq "explicit HOST: variadic conf rm ssh'd there" "$(tail -n 1 "$CALLS")" "ssh eli@sg3"
+
+# neither the argument nor the variable: a clear error, and APP is still checked
+out=$(TINYDEPLOY_HOST= "$DEPLOY" init lonelyapp 2>&1); rc=$?
+eq "no HOST and no variable exits 2" "$rc" 2
+case "$out" in *TINYDEPLOY_HOST*) ok "no HOST error names the variable" ;; *) bad "no HOST error names the variable"; echo "$out" | sed 's/^/    | /' ;; esac
+TINYDEPLOY_HOST=eli@sg9 "$DEPLOY" init 'bad name' >/dev/null 2>&1; rc=$?
+eq "env host: bad APP still rejected" "$rc" 2
+
+echo
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "FAILURES PRESENT"; fi
 exit "$fail"
