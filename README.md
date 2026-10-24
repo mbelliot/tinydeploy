@@ -104,6 +104,9 @@ ssh HOST 'cat > ~/deploy/post-receive && chmod 755 ~/deploy/post-receive' < post
 
 ## Notes
 
+- `deploy.sh` may be symlinked onto `PATH` (e.g. `~/bin/deploy.sh`): it
+  resolves its own location, so `init` finds the `post-receive` next to the
+  real file rather than next to the link.
 - `refs/heads/master` only (`DEPLOY_REF` overrides); branch deletes no-op.
 - Each deploy prunes every other release dir for the app, so rollback is a
   re-push of the old commit, not a symlink flip. Re-pushing the deployed commit

@@ -385,7 +385,18 @@ cmd_init() {
         *) usage 2 ;;
     esac
     check_app "$APP"
-    HOOK=$(cd "$(dirname "$0")" && pwd)/post-receive
+    # $0 may be a symlink (~/bin/deploy.sh or anything else on PATH), so follow
+    # it first: the hook that belongs to this install sits next to the real
+    # file, not next to the link.
+    self=$0
+    while [ -L "$self" ]; do
+        link=$(readlink "$self") || die "could not read the symlink $self"
+        case "$link" in
+            /*) self=$link ;;
+            *) self=$(cd -P "$(dirname "$self")" && pwd)/$link ;;
+        esac
+    done
+    HOOK=$(cd -P "$(dirname "$self")" && pwd)/post-receive
     if [ ! -f "$HOOK" ]; then
         die "no post-receive next to this script ($HOOK)"
     fi

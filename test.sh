@@ -322,6 +322,17 @@ out=$("$SB/lonely/deploy.sh" init eli@sg1 newapp 2>&1); rc=$?
 eq "no hook next to the script fails" "$rc" 1
 case "$out" in *"no post-receive next to this script"*) ok "missing hook named in error" ;; *) bad "missing hook named in error" ;; esac
 
+# a symlinked deploy.sh (say ~/bin/deploy.sh on PATH) must find the hook next
+# to the real file, not next to the link
+mkdir -p "$SB/pathdir"
+ln -sfn "$DEPLOY" "$SB/pathdir/deploy.sh"
+ln -sfn "$SB/pathdir/deploy.sh" "$SB/pathdir/deploy-link.sh"
+out=$("$SB/pathdir/deploy-link.sh" init eli@sg1 linked 2>&1); rc=$?
+eq "symlinked deploy.sh init exits 0" "$rc" 0
+case "$out" in *"Initialized linked on eli@sg1."*) ok "symlinked init reports success" ;; *) bad "symlinked init reports success"; echo "$out" | sed 's/^/    | /' ;; esac
+same "symlinked init installs the real hook" "$HOOK" "$ISB/post-receive"
+is_dir "symlinked init created the repo" "$ISB/repos/linked"
+
 echo
 echo "=== 7. deploy.sh env: set/get/ls/rm/import/edit ==="
 ENVFILE="$ISB/shared/newapp/env"
