@@ -6,19 +6,18 @@
 # is never touched (systemctl is a stub early on PATH). deploy.sh is driven
 # through a stub ssh that runs its remote half locally against the same sandbox.
 #
-#   sh test.sh                 # uses $FRAMER (default ~/projects/framer) as the real-tree case
-#   FRAMER= SB=/tmp/x sh test.sh
+#   sh test.sh                 # sandbox lives in $TMPDIR/deploy-hook-test
+#   SB=/tmp/x sh test.sh
 set -u
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 HOOK="$DIR/post-receive"
 DEPLOY="$DIR/deploy.sh"
-FRAMER=${FRAMER:-$HOME/projects/framer}
 SB=${SB:-${TMPDIR:-/tmp}/deploy-hook-test}
 
 rm -rf "$SB"
 mkdir -p "$SB/bin" "$SB/home" "$SB/repos" "$SB/src" "$SB/live" \
-         "$SB/shared/framer" "$SB/shared/nodeapp" "$SB/shared/pyapp" "$SB/shared/weird"
+         "$SB/shared/webapp" "$SB/shared/nodeapp" "$SB/shared/pyapp" "$SB/shared/weird"
 export HOME="$SB/home"
 export PATH="$SB/bin:$PATH"
 export CALLS="$SB/calls.log"
@@ -97,8 +96,15 @@ make_repo() { # name -> bare repo whose hook symlinks the shared hook, plus env
     printf 'DATABASE_URL=postgresql://sandbox/db\n' > "$SB/shared/$1/env"
 }
 
+init_src() { # dir -> repo with master checked out, on git old enough to lack -b
+    git init -q -b master "$1" 2>/dev/null || {
+        git init -q "$1"
+        git -C "$1" symbolic-ref HEAD refs/heads/master
+    }
+}
+
 app_repo() { # name -> source repo with one commit
-    git init -q -b master "$SB/src/$1"
+    init_src "$SB/src/$1"
     git -C "$SB/src/$1" config user.email t@example.com
     git -C "$SB/src/$1" config user.name Test
     printf '{\n  "scripts": { "build": "astro build", "start": "node dist/server/entry.mjs" }\n}\n' > "$SB/src/$1/package.json"
@@ -107,36 +113,37 @@ app_repo() { # name -> source repo with one commit
     git -C "$SB/src/$1" commit -qm one
 }
 
-# --- 1. a real app tree (node, no deploy.conf) --------------------------------
-if [ -d "$FRAMER/.git" ]; then
-    echo "=== 1. real app repo: $FRAMER (node, no conf) ==="
-    make_repo framer
-    push_out=$(git -C "$FRAMER" push "$SB/repos/framer" master 2>&1); push_rc=$?
-    echo "$push_out" | sed 's/^/    | /'
-    eq "push succeeded" "$push_rc" 0
-    HASH=$(git -C "$SB/repos/framer" rev-parse --short master)
-    REL="$SB/live/framer!$HASH"
-    is_file "release tree checked out" "$REL/package.json"
-    is_file "real source present" "$REL/src/lib/db.ts"
-    is_absent "no .env written (env comes from the unit)" "$REL/.env"
-    is_file "pnpm build ran in the release" "$REL/dist/server/entry.mjs"
-    is_dir "pnpm install ran in the release" "$REL/node_modules"
-    has "sync command" "pnpm install --frozen-lockfile" "$CALLS"
-    has "build command" "pnpm build" "$CALLS"
-    UNIT="$SB/home/.config/systemd/user/framer.service"
-    is_file "unit installed" "$UNIT"
-    has "unit exec" "ExecStart=$SB/bin/pnpm start" "$UNIT"
-    has "unit working dir" "WorkingDirectory=$SB/live/framer!CURRENT" "$UNIT"
-    has "unit env file" "EnvironmentFile=-$SB/shared/framer/env" "$UNIT"
-    has "unit runtime env" "Environment=NODE_ENV=production" "$UNIT"
-    has "unit restart policy" "Restart=on-failure" "$UNIT"
-    eq "CURRENT symlink" "$(readlink -f "$SB/live/framer!CURRENT")" "$REL"
-    has "service enabled" "systemctl --user enable framer.service" "$CALLS"
-    has "service restarted" "systemctl --user restart framer.service" "$CALLS"
-    case "$push_out" in *"Deployed framer $HASH."*) ok "deploy summary printed" ;; *) bad "deploy summary printed" ;; esac
-else
-    echo "=== 1. skipped: $FRAMER is not a git work tree (set FRAMER=... to run it) ==="
-fi
+# --- 1. a plain node app (no deploy.conf) --------------------------------------
+echo "=== 1. node app, no deploy.conf ==="
+make_repo webapp
+app_repo webapp
+mkdir -p "$SB/src/webapp/src/lib"
+printf 'export const db = 1\n' > "$SB/src/webapp/src/lib/db.ts"
+git -C "$SB/src/webapp" add -A
+git -C "$SB/src/webapp" commit -qm two
+push_out=$(git -C "$SB/src/webapp" push "$SB/repos/webapp" master 2>&1); push_rc=$?
+echo "$push_out" | sed 's/^/    | /'
+eq "push succeeded" "$push_rc" 0
+HASH=$(git -C "$SB/repos/webapp" rev-parse --short master)
+REL="$SB/live/webapp!$HASH"
+is_file "release tree checked out" "$REL/package.json"
+is_file "source present" "$REL/src/lib/db.ts"
+is_absent "no .env written (env comes from the unit)" "$REL/.env"
+is_file "pnpm build ran in the release" "$REL/dist/server/entry.mjs"
+is_dir "pnpm install ran in the release" "$REL/node_modules"
+has "sync command" "pnpm install --frozen-lockfile" "$CALLS"
+has "build command" "pnpm build" "$CALLS"
+UNIT="$SB/home/.config/systemd/user/webapp.service"
+is_file "unit installed" "$UNIT"
+has "unit exec" "ExecStart=$SB/bin/pnpm start" "$UNIT"
+has "unit working dir" "WorkingDirectory=$SB/live/webapp!CURRENT" "$UNIT"
+has "unit env file" "EnvironmentFile=-$SB/shared/webapp/env" "$UNIT"
+has "unit runtime env" "Environment=NODE_ENV=production" "$UNIT"
+has "unit restart policy" "Restart=on-failure" "$UNIT"
+eq "CURRENT symlink" "$(readlink -f "$SB/live/webapp!CURRENT")" "$REL"
+has "service enabled" "systemctl --user enable webapp.service" "$CALLS"
+has "service restarted" "systemctl --user restart webapp.service" "$CALLS"
+case "$push_out" in *"Deployed webapp $HASH."*) ok "deploy summary printed" ;; *) bad "deploy summary printed" ;; esac
 
 echo
 echo "=== 2. repeat deploys: prune, branch filter, re-push guard ==="
@@ -178,7 +185,7 @@ case "$del_out" in *"nothing to deploy"*) ok "branch deletion is a no-op" ;; *) 
 echo
 echo "=== 3. uv app with deploy.conf (AFTER_SYNC, UNIT_ENV placeholders) ==="
 make_repo pyapp
-git init -q -b master "$SB/src/pyapp"
+init_src "$SB/src/pyapp"
 git -C "$SB/src/pyapp" config user.email t@example.com
 git -C "$SB/src/pyapp" config user.name Test
 printf 'print("hi")\n' > "$SB/src/pyapp/main.py"
@@ -208,7 +215,7 @@ echo "=== 3b. deploy.conf commands are shell snippets ==="
 # "Failed to spawn: scripts/seed.py;" instead of running both.
 make_repo multi
 mkdir -p "$SB/src/multi"
-git init -q -b master "$SB/src/multi"
+init_src "$SB/src/multi"
 git -C "$SB/src/multi" config user.email t@example.com
 git -C "$SB/src/multi" config user.name Test
 printf 'print("hi")\n' > "$SB/src/multi/main.py"
@@ -233,7 +240,7 @@ case "$out" in *after-one*after-two*) ok "AFTER_SYNC ran both commands" ;; *) ba
 # rest of the snippet never runs.
 make_repo multibad
 mkdir -p "$SB/src/multibad"
-git init -q -b master "$SB/src/multibad"
+init_src "$SB/src/multibad"
 git -C "$SB/src/multibad" config user.email t@example.com
 git -C "$SB/src/multibad" config user.name Test
 printf 'print("hi")\n' > "$SB/src/multibad/main.py"
@@ -252,7 +259,7 @@ echo "=== 3c. deploy-time commands see the app's env ==="
 # no DATABASE_URL and libpq fell back to the server's own OS user.
 make_repo envapp
 mkdir -p "$SB/src/envapp"
-git init -q -b master "$SB/src/envapp"
+init_src "$SB/src/envapp"
 git -C "$SB/src/envapp" config user.email t@example.com
 git -C "$SB/src/envapp" config user.name Test
 printf 'print("hi")\n' > "$SB/src/envapp/main.py"
@@ -284,20 +291,29 @@ echo
 echo "=== 4. failure paths ==="
 # env is optional: no env file still deploys, and the unit's EnvironmentFile=
 # carries the '-' prefix so systemd starts the app with the file absent.
-restarts_before=$(grep -c "restart framer.service" "$CALLS" || true)
-rm -f "$SB/shared/framer/env"
+# A sandbox app of its own: section 1's real tree is optional, so this must not
+# depend on its repo, unit or release dir (an env-less deploy of the real tree
+# would need it).
+make_repo envless
+app_repo envless
+git -C "$SB/src/envless" push -q "$SB/repos/envless" master
+HE=$(git -C "$SB/repos/envless" rev-parse --short master)
+REL_E="$SB/live/envless!$HE"
+UNIT_E="$SB/home/.config/systemd/user/envless.service"
+restarts_before=$(grep -c "restart envless.service" "$CALLS" || true)
+rm -f "$SB/shared/envless/env"
 # a no-op push wouldn't run the hook at all, so re-create the ref first
-git -C "$SB/repos/framer" update-ref -d refs/heads/master
-out=$(git -C "$FRAMER" push "$SB/repos/framer" master 2>&1); rc=$?
+git -C "$SB/repos/envless" update-ref -d refs/heads/master
+out=$(git -C "$SB/src/envless" push "$SB/repos/envless" master 2>&1); rc=$?
 eq "push without env succeeds" "$rc" 0
 case "$out" in *"DEPLOY FAILED"*) bad "missing env does not fail the deploy"; echo "$out" ;; *) ok "missing env does not fail the deploy" ;; esac
-case "$out" in *"$SB/shared/framer/env is missing - deploying without it"*) ok "missing env noted in push output" ;; *) bad "missing env noted in push output"; echo "$out" ;; esac
-has "unit tolerates a missing env file" "EnvironmentFile=-$SB/shared/framer/env" "$UNIT"
-eq "app restarted without env" "$(grep -c 'restart framer.service' "$CALLS")" "$((restarts_before + 1))"
-eq "CURRENT holds the env-less deploy" "$(readlink -f "$SB/live/framer!CURRENT")" "$REL"
-printf 'DATABASE_URL=x\n' > "$SB/shared/framer/env"
+case "$out" in *"$SB/shared/envless/env is missing - deploying without it"*) ok "missing env noted in push output" ;; *) bad "missing env noted in push output"; echo "$out" ;; esac
+has "unit tolerates a missing env file" "EnvironmentFile=-$SB/shared/envless/env" "$UNIT_E"
+eq "app restarted without env" "$(grep -c 'restart envless.service' "$CALLS")" "$((restarts_before + 1))"
+eq "CURRENT holds the env-less deploy" "$(readlink -f "$SB/live/envless!CURRENT")" "$REL_E"
+printf 'DATABASE_URL=x\n' > "$SB/shared/envless/env"
 
-git init -q -b master "$SB/src/weird"
+init_src "$SB/src/weird"
 git -C "$SB/src/weird" config user.email t@example.com
 git -C "$SB/src/weird" config user.name Test
 echo hi > "$SB/src/weird/README.md"
@@ -308,7 +324,7 @@ out=$(git -C "$SB/src/weird" push "$SB/repos/weird" master 2>&1)
 case "$out" in *"no uv.lock or pnpm-lock.yaml"*) ok "undetectable app fails clearly" ;; *) bad "undetectable app fails clearly"; echo "$out" ;; esac
 
 make_repo nomain
-git init -q -b master "$SB/src/nomain"
+init_src "$SB/src/nomain"
 git -C "$SB/src/nomain" config user.email t@example.com
 git -C "$SB/src/nomain" config user.name Test
 echo "version = 1" > "$SB/src/nomain/uv.lock"

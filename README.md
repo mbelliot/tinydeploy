@@ -7,9 +7,9 @@ at `~/deploy/post-receive`, symlinked from every repo's `hooks/post-receive`.
 ## New app
 
 ```sh
-./deploy.sh init eli@sg1 framer                                    # dirs, repo, hook
-./deploy.sh env set eli@sg1 framer DATABASE_URL=postgresql://...   # secrets
-git remote add deploy eli@sg1:deploy/repos/framer
+./deploy.sh init eli@sg1 myapp                                    # dirs, repo, hook
+./deploy.sh env set eli@sg1 myapp DATABASE_URL=postgresql://...   # secrets
+git remote add deploy eli@sg1:deploy/repos/myapp
 git push deploy master
 ```
 
@@ -17,8 +17,8 @@ git push deploy master
 
 ```sh
 export TINYDEPLOY_HOST=eli@sg1
-./deploy.sh init framer
-./deploy.sh env set framer DATABASE_URL=postgresql://...
+./deploy.sh init myapp
+./deploy.sh env set myapp DATABASE_URL=postgresql://...
 ```
 
 A HOST passed on the command line still wins. `env set|rm` and `conf set|rm`
@@ -176,5 +176,6 @@ ssh HOST 'cat > ~/deploy/post-receive && chmod 755 ~/deploy/post-receive' < post
 ## Testing
 
 `sh test.sh` sandboxes the hook and `deploy.sh` (fake tools, stub `ssh`, real
-pushes); `FRAMER=<repo>` adds a real app tree, `FRAMER=` skips it. Run it before
-installing a change anywhere.
+pushes) against repos it creates itself; nothing outside the sandbox is touched.
+`sh multi_test.sh` does the same for `PROCS` (one unit per process). Neither
+needs arguments; run both before installing a change anywhere.

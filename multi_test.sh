@@ -1,7 +1,12 @@
 #!/bin/sh
+# Sandbox test for PROCS (one unit per process) in the hook next to this script.
+#
+#   sh multi_test.sh              # sandbox lives in $TMPDIR/multi-test
+#   SB=/tmp/x sh multi_test.sh
 set -u
-HOOK=${HOOK:-/home/claude/tinydeploy/post-receive}
-SB=/tmp/multi-test; rm -rf "$SB"
+DIR=$(cd "$(dirname "$0")" && pwd)
+HOOK=${HOOK:-$DIR/post-receive}
+SB=${SB:-${TMPDIR:-/tmp}/multi-test}; rm -rf "$SB"
 mkdir -p "$SB/bin" "$SB/home" "$SB/repos" "$SB/src/app" "$SB/live" "$SB/shared/app"
 export HOME="$SB/home" PATH="$SB/bin:$PATH" CALLS="$SB/calls.log"; : > "$CALLS"
 cat > "$SB/bin/uv" <<'F'
