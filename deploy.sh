@@ -10,7 +10,7 @@
 #   ./deploy.sh env rm [HOST] APP KEY [KEY ...]
 #   ./deploy.sh env import [HOST] APP FILE|-          (KEY=value lines)
 #   ./deploy.sh env edit [HOST] APP                   ($EDITOR, then upload)
-#   ./deploy.sh conf set [HOST] APP KEY=VALUE [...]   (SYNC AFTER_SYNC BUILD EXEC UNIT_ENV)
+#   ./deploy.sh conf set [HOST] APP KEY=VALUE [...]   (SYNC AFTER_SYNC BUILD EXEC UNIT_ENV PROCS EXEC_<name>)
 #   ./deploy.sh conf get|ls|rm|import|edit|show [HOST] APP ...
 #
 # HOST is optional when TINYDEPLOY_HOST is set; an explicit HOST wins. The
@@ -341,11 +341,18 @@ apply_upload() { # $1 file, $2 apply function, $3 pairs/keys file, $4 validator
 # error. rm is not restricted - deleting a hand-written key is always fine.
 CONF_KEYS=" SYNC AFTER_SYNC BUILD EXEC UNIT_ENV "
 
+# PROCS lists extra process names; each one needs an EXEC_<name> command. The
+# hook turns every name into its own <app>-<name>.service.
 conf_key_ok() {
     case "$CONF_KEYS" in
         *" $1 "*) return 0 ;;
-        *) return 1 ;;
     esac
+    case "$1" in
+        PROCS) return 0 ;;
+        EXEC_*[!A-Za-z0-9_]*) return 1 ;;
+        EXEC_?*) return 0 ;;
+    esac
+    return 1
 }
 
 # Store a command verbatim as one shell word: single-quoted, with embedded
@@ -401,7 +408,7 @@ conf_warn_keys() { # $1 file
     awk -v allowed="$CONF_KEYS" '
         match($0, /^[A-Za-z_][A-Za-z0-9_]*=/) {
             k = substr($0, 1, RLENGTH - 1)
-            if (index(allowed, " " k " ") == 0) {
+            if (index(allowed, " " k " ") == 0 && k != "PROCS" && k !~ /^EXEC_[A-Za-z0-9_]+$/) {
                 print "deploy: note: " k " is not read by the hook; left as-is." > "/dev/stderr"
             }
         }
@@ -670,7 +677,7 @@ cmd_conf_set() {
         key=${arg%%=*}
         value=${arg#*=}
         valid_key "$key" || bad "invalid key: $key"
-        conf_key_ok "$key" || bad "not a deploy.conf key: $key (one of:${CONF_KEYS% })"
+        conf_key_ok "$key" || bad "not a deploy.conf key: $key (one of:${CONF_KEYS% } PROCS EXEC_<name>)"
         check_value "$key" "$value"
         printf '%s=%s\n' "$key" "$(encode_sh "$value")" >> "$pairs"
         keys="$keys $key"
@@ -775,7 +782,7 @@ cmd_conf_import() {
         # keeping it would store the quotes as part of the command.
         value=$(unquote_value "${line#*=}")
         valid_key "$key" || bad "line $lineno: invalid key: $key"
-        conf_key_ok "$key" || bad "line $lineno: not a deploy.conf key: $key (one of:${CONF_KEYS% })"
+        conf_key_ok "$key" || bad "line $lineno: not a deploy.conf key: $key (one of:${CONF_KEYS% } PROCS EXEC_<name>)"
         printf '%s=%s\n' "$key" "$(encode_sh "$value")" >> "$pairs"
         keys="$keys $key"
         count=$((count + 1))

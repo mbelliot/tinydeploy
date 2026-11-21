@@ -1,0 +1,248 @@
+diff --git a/README.md b/README.md
+index 076a8cc..e5c530c 100644
+--- a/README.md
++++ b/README.md
+@@ -59,6 +59,7 @@ parses instead of a string that still has quotes in it.
+ | `~/deploy/shared/<app>/env` | optional environment file; `EnvironmentFile=-` in the unit, exported to the deploy commands |
+ | `~/deploy/shared/<app>/deploy.conf` | optional command overrides |
+ | `~/.config/systemd/user/<app>.service` | generated; regenerated when it differs |
++| `~/.config/systemd/user/<app>-<name>.service` | generated per `PROCS` entry (see [Multiple processes](#multiple-processes)) |
+ 
+ ## Detection and overrides
+ 
+@@ -76,7 +77,8 @@ Anything else goes in `~/deploy/shared/<app>/deploy.conf` (server-side,
+ ./deploy.sh conf get|ls|rm|import|edit|show HOST APP ...
+ ```
+ 
+-`conf set` and `conf import` accept only the five keys below, so an `EXE=` typo
++`conf set` and `conf import` accept only the keys below (`SYNC`, `AFTER_SYNC`,
++`BUILD`, `EXEC`, `UNIT_ENV`, `PROCS` and `EXEC_<name>`), so an `EXE=` typo
+ fails (exit 2) instead of sitting in the file doing nothing; `conf rm` removes
+ any key, including hand-written ones. An imported value may carry the file's own
+ quoting, as in the example below — `conf import` strips the outer pair, so
+@@ -106,6 +108,40 @@ value may be several commands and a failure anywhere stops the deploy:
+ `ExecStart=` line instead — one process, no shell, so no `;`, `&&` or `$VAR`
+ (unquoted `uv` is fine: the unit's PATH starts with `~/.local/bin`).
+ 
++## Multiple processes
++
++One app, several processes (web plus a worker, say): `EXEC` stays the main
++process, and `PROCS` lists extra ones, each with its own `EXEC_<name>` command.
++
++```
++EXEC="{live_curr}/.venv/bin/python -m myapp.api"
++PROCS="worker beat"
++EXEC_worker="{live_curr}/.venv/bin/python -m myapp.worker"
++EXEC_beat="{live_curr}/.venv/bin/python -m myapp.beat"
++```
++
++```
++./deploy.sh conf set HOST APP PROCS="worker beat" EXEC_worker="{live_curr}/.venv/bin/python -m myapp.worker"
++```
++
++Every name becomes `~/.config/systemd/user/<app>-<name>.service`, generated
++like the main unit (same cwd, env file, `UNIT_ENV` and `Restart=on-failure`)
++plus `PartOf=<app>.service`. A deploy restarts `<app>.service`, which restarts
++the extra units that are running; ones added by this push are started. Each
++unit restarts on its own when it fails, so a crashing worker doesn't take the
++others down.
++
++- Names are letters, digits and `_`. Each needs a non-empty `EXEC_<name>`, or
++  the deploy fails naming `deploy.conf`. As with `EXEC`, each command is one
++  process with no shell, and `{live_curr}` gives an absolute path.
++- Removing a name from `PROCS` stops, disables and deletes its unit on the next
++  push. Generated extra units carry a `# proc-of: <app>` line; the hook only
++  touches files that have it, and refuses to overwrite a unit that doesn't
++  (an app called `myapp-worker` is not `myapp`'s `worker`).
++- All units of an app share `env` and `UNIT_ENV`; there is no per-process
++  environment.
++- Without `PROCS` nothing changes: one unit, as before.
++
+ ## Hook updates
+ 
+ Git reads the shared file fresh on every push, so one write updates every app:
+diff --git a/deploy.sh b/deploy.sh
+index 0f567b3..7f14e79 100755
+--- a/deploy.sh
++++ b/deploy.sh
+@@ -10,7 +10,7 @@
+ #   ./deploy.sh env rm [HOST] APP KEY [KEY ...]
+ #   ./deploy.sh env import [HOST] APP FILE|-          (KEY=value lines)
+ #   ./deploy.sh env edit [HOST] APP                   ($EDITOR, then upload)
+-#   ./deploy.sh conf set [HOST] APP KEY=VALUE [...]   (SYNC AFTER_SYNC BUILD EXEC UNIT_ENV)
++#   ./deploy.sh conf set [HOST] APP KEY=VALUE [...]   (SYNC AFTER_SYNC BUILD EXEC UNIT_ENV PROCS EXEC_<name>)
+ #   ./deploy.sh conf get|ls|rm|import|edit|show [HOST] APP ...
+ #
+ # HOST is optional when TINYDEPLOY_HOST is set; an explicit HOST wins. The
+@@ -341,11 +341,18 @@ apply_upload() { # $1 file, $2 apply function, $3 pairs/keys file, $4 validator
+ # error. rm is not restricted - deleting a hand-written key is always fine.
+ CONF_KEYS=" SYNC AFTER_SYNC BUILD EXEC UNIT_ENV "
+ 
++# PROCS lists extra process names; each one needs an EXEC_<name> command. The
++# hook turns every name into its own <app>-<name>.service.
+ conf_key_ok() {
+     case "$CONF_KEYS" in
+         *" $1 "*) return 0 ;;
+-        *) return 1 ;;
+     esac
++    case "$1" in
++        PROCS) return 0 ;;
++        EXEC_*[!A-Za-z0-9_]*) return 1 ;;
++        EXEC_?*) return 0 ;;
++    esac
++    return 1
+ }
+ 
+ # Store a command verbatim as one shell word: single-quoted, with embedded
+@@ -401,7 +408,7 @@ conf_warn_keys() { # $1 file
+     awk -v allowed="$CONF_KEYS" '
+         match($0, /^[A-Za-z_][A-Za-z0-9_]*=/) {
+             k = substr($0, 1, RLENGTH - 1)
+-            if (index(allowed, " " k " ") == 0) {
++            if (index(allowed, " " k " ") == 0 && k != "PROCS" && k !~ /^EXEC_[A-Za-z0-9_]+$/) {
+                 print "deploy: note: " k " is not read by the hook; left as-is." > "/dev/stderr"
+             }
+         }
+@@ -670,7 +677,7 @@ cmd_conf_set() {
+         key=${arg%%=*}
+         value=${arg#*=}
+         valid_key "$key" || bad "invalid key: $key"
+-        conf_key_ok "$key" || bad "not a deploy.conf key: $key (one of:${CONF_KEYS% })"
++        conf_key_ok "$key" || bad "not a deploy.conf key: $key (one of:${CONF_KEYS% } PROCS EXEC_<name>)"
+         check_value "$key" "$value"
+         printf '%s=%s\n' "$key" "$(encode_sh "$value")" >> "$pairs"
+         keys="$keys $key"
+@@ -775,7 +782,7 @@ cmd_conf_import() {
+         # keeping it would store the quotes as part of the command.
+         value=$(unquote_value "${line#*=}")
+         valid_key "$key" || bad "line $lineno: invalid key: $key"
+-        conf_key_ok "$key" || bad "line $lineno: not a deploy.conf key: $key (one of:${CONF_KEYS% })"
++        conf_key_ok "$key" || bad "line $lineno: not a deploy.conf key: $key (one of:${CONF_KEYS% } PROCS EXEC_<name>)"
+         printf '%s=%s\n' "$key" "$(encode_sh "$value")" >> "$pairs"
+         keys="$keys $key"
+         count=$((count + 1))
+diff --git a/post-receive b/post-receive
+index 8ab9ed0..a33f307 100755
+--- a/post-receive
++++ b/post-receive
+@@ -254,21 +254,32 @@ if [ -n "${BUILD:-}" ]; then
+     run_cmd build "$BUILD"
+ fi
+ 
+-# --- systemd user unit (regenerated when it differs) -------------------------
++# --- systemd user units (regenerated when they differ) -----------------------
++# The main unit runs EXEC. Optional extra processes come from deploy.conf:
++#   PROCS="worker beat"
++#   EXEC_worker="{live_curr}/.venv/bin/python -m myapp.worker"
++# Each becomes <app>-<name>.service, PartOf the main unit, so a restart of the
++# main unit (which every deploy does) restarts them too.
++UNIT_DIR="${HOME}/.config/systemd/user"
+ UNIT_EXTRA=""
+ for line in ${UNIT_ENV:-}; do
+     UNIT_EXTRA="${UNIT_EXTRA}Environment=${line}
+ "
+ done
+ 
+-UNIT_BODY="# Generated by post-receive - edit ${SHARED_CONF}, not this file.
++write_unit() { # $1 unit name, $2 description, $3 ExecStart, $4 extra [Unit] lines
++    _file="${UNIT_DIR}/$1.service"
++    _xu=""
++    if [ -n "${4:-}" ]; then _xu="$4
++"; fi
++    _body="# Generated by post-receive - edit ${SHARED_CONF}, not this file.
+ [Unit]
+-Description=${SERVICE_NAME}
++Description=$2
+ After=network.target
+-[Service]
++${_xu}[Service]
+ Type=simple
+ WorkingDirectory=${LIVE_DIR_CURR}
+-ExecStart=${EXEC}
++ExecStart=$3
+ Restart=on-failure
+ RestartSec=5
+ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+@@ -276,23 +287,57 @@ EnvironmentFile=-${SHARED_ENV}
+ ${UNIT_EXTRA}[Install]
+ WantedBy=default.target
+ "
++    _new=0
++    if [ ! -f "$_file" ]; then
++        _new=1
++    fi
++    # Both sides go through command substitution so the comparison ignores a
++    # trailing newline; otherwise every deploy would look like a change.
++    if [ "$_new" = 1 ] || [ "$(cat "$_file" 2>/dev/null)" != "$(printf '%s' "$_body")" ]; then
++        echo "Installing $1.service..."
++        mkdir -p "$UNIT_DIR"
++        printf '%s' "$_body" > "$_file"
++        systemctl --user daemon-reload
++        if [ "$_new" = 1 ]; then
++            systemctl --user enable "$1.service"
++        fi
++    fi
++}
+ 
+-NEW_UNIT=0
+-if [ ! -f "$UNIT_FILE" ]; then
+-    NEW_UNIT=1
+-fi
++write_unit "$SERVICE_NAME" "$SERVICE_NAME" "$EXEC" ""
+ 
+-# Both sides go through command substitution so the comparison ignores a
+-# trailing newline; otherwise every deploy would look like a change.
+-if [ "$NEW_UNIT" = 1 ] || [ "$(cat "$UNIT_FILE" 2>/dev/null)" != "$(printf '%s' "$UNIT_BODY")" ]; then
+-    echo "Installing ${SERVICE_NAME}.service..."
+-    mkdir -p "$(dirname "$UNIT_FILE")"
+-    printf '%s' "$UNIT_BODY" > "$UNIT_FILE"
+-    systemctl --user daemon-reload
+-    if [ "$NEW_UNIT" = 1 ]; then
+-        systemctl --user enable "${SERVICE_NAME}.service"
++PROC_MARK="# proc-of: ${SERVICE_NAME}"
++PROC_UNITS=""
++for p in ${PROCS:-}; do
++    case $p in
++        *[!A-Za-z0-9_]*) die "bad process name '${p}' in PROCS (letters, digits, _ only)." ;;
++    esac
++    eval "cmd=\${EXEC_$p:-}"
++    if [ -z "$cmd" ]; then die "EXEC_${p} is empty - set it in ${SHARED_CONF}."; fi
++    cmd=$(printf '%s' "$cmd" | expand)
++    unit="${SERVICE_NAME}-${p}"
++    # Another app can be called <app>-<name>; never overwrite its unit.
++    if [ -f "${UNIT_DIR}/${unit}.service" ] \
++        && ! grep -qxF "$PROC_MARK" "${UNIT_DIR}/${unit}.service"; then
++        die "${UNIT_DIR}/${unit}.service exists and was not generated for ${SERVICE_NAME}."
+     fi
+-fi
++    write_unit "$unit" "${SERVICE_NAME} ${p}" "$cmd" "${PROC_MARK}
++PartOf=${SERVICE_NAME}.service"
++    PROC_UNITS="${PROC_UNITS} ${unit}"
++done
++
++# A process dropped from PROCS: stop, disable and remove its unit. Only files
++# carrying this app's marker are touched.
++for f in "${UNIT_DIR}"/*.service; do
++    if [ ! -f "$f" ]; then continue; fi
++    grep -qxF "$PROC_MARK" "$f" || continue
++    u=$(basename "$f" .service)
++    case " ${PROC_UNITS} " in *" ${u} "*) continue ;; esac
++    echo "Removing stale ${u}.service..."
++    systemctl --user disable --now "${u}.service" || true
++    rm -f "$f"
++    systemctl --user daemon-reload
++done
+ 
+ # --- activate -----------------------------------------------------------------
+ echo "Linking CURRENT -> ${HASH}..."
+@@ -301,6 +346,10 @@ ln -sfn "$(basename "$LIVE_DIR")" "$(basename "$LIVE_DIR_CURR")"
+ 
+ echo "Restarting ${SERVICE_NAME}..."
+ systemctl --user restart "${SERVICE_NAME}.service"
++# PartOf restarts the extra units that are already running; start covers new ones.
++for u in ${PROC_UNITS}; do
++    systemctl --user start "${u}.service"
++done
+ 
+ # Every other release dir for this repo is either the one just replaced or the
+ # wreckage of a deploy that died before it was activated - neither is reachable

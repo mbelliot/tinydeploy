@@ -59,6 +59,7 @@ parses instead of a string that still has quotes in it.
 | `~/deploy/shared/<app>/env` | optional environment file; `EnvironmentFile=-` in the unit, exported to the deploy commands |
 | `~/deploy/shared/<app>/deploy.conf` | optional command overrides |
 | `~/.config/systemd/user/<app>.service` | generated; regenerated when it differs |
+| `~/.config/systemd/user/<app>-<name>.service` | generated per `PROCS` entry (see [Multiple processes](#multiple-processes)) |
 
 ## Detection and overrides
 
@@ -76,7 +77,8 @@ Anything else goes in `~/deploy/shared/<app>/deploy.conf` (server-side,
 ./deploy.sh conf get|ls|rm|import|edit|show HOST APP ...
 ```
 
-`conf set` and `conf import` accept only the five keys below, so an `EXE=` typo
+`conf set` and `conf import` accept only the keys below (`SYNC`, `AFTER_SYNC`,
+`BUILD`, `EXEC`, `UNIT_ENV`, `PROCS` and `EXEC_<name>`), so an `EXE=` typo
 fails (exit 2) instead of sitting in the file doing nothing; `conf rm` removes
 any key, including hand-written ones. An imported value may carry the file's own
 quoting, as in the example below — `conf import` strips the outer pair, so
@@ -105,6 +107,40 @@ value may be several commands and a failure anywhere stops the deploy:
 `BUILD="uv run scripts/recreate_db.py; pnpm run build"`. `EXEC` is an
 `ExecStart=` line instead — one process, no shell, so no `;`, `&&` or `$VAR`
 (unquoted `uv` is fine: the unit's PATH starts with `~/.local/bin`).
+
+## Multiple processes
+
+One app, several processes (web plus a worker, say): `EXEC` stays the main
+process, and `PROCS` lists extra ones, each with its own `EXEC_<name>` command.
+
+```
+EXEC="{live_curr}/.venv/bin/python -m myapp.api"
+PROCS="worker beat"
+EXEC_worker="{live_curr}/.venv/bin/python -m myapp.worker"
+EXEC_beat="{live_curr}/.venv/bin/python -m myapp.beat"
+```
+
+```
+./deploy.sh conf set HOST APP PROCS="worker beat" EXEC_worker="{live_curr}/.venv/bin/python -m myapp.worker"
+```
+
+Every name becomes `~/.config/systemd/user/<app>-<name>.service`, generated
+like the main unit (same cwd, env file, `UNIT_ENV` and `Restart=on-failure`)
+plus `PartOf=<app>.service`. A deploy restarts `<app>.service`, which restarts
+the extra units that are running; ones added by this push are started. Each
+unit restarts on its own when it fails, so a crashing worker doesn't take the
+others down.
+
+- Names are letters, digits and `_`. Each needs a non-empty `EXEC_<name>`, or
+  the deploy fails naming `deploy.conf`. As with `EXEC`, each command is one
+  process with no shell, and `{live_curr}` gives an absolute path.
+- Removing a name from `PROCS` stops, disables and deletes its unit on the next
+  push. Generated extra units carry a `# proc-of: <app>` line; the hook only
+  touches files that have it, and refuses to overwrite a unit that doesn't
+  (an app called `myapp-worker` is not `myapp`'s `worker`).
+- All units of an app share `env` and `UNIT_ENV`; there is no per-process
+  environment.
+- Without `PROCS` nothing changes: one unit, as before.
 
 ## Hook updates
 
